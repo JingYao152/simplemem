@@ -120,6 +120,18 @@ class VectorStoreBackend(Protocol):
         """Return the records with the given ids (missing ids are skipped)."""
         ...
 
+    def find_by_field(
+        self,
+        field: str,
+        values: Sequence[str],
+    ) -> List[VectorStoreSearchResult]:
+        """Return every record whose ``field`` equals one of ``values``.
+
+        Needed to walk an edge backwards: MemWeaver's one-hop expansion has to
+        find the entries that point *at* a candidate (``superseded_by``).
+        """
+        ...
+
     def update_metadata(self, entry_id: str, fields: Dict[str, Any]) -> None:
         """Update metadata fields of one stored record in place."""
         ...
@@ -380,6 +392,20 @@ class LanceDBVectorStoreBackend:
         # Preserve the caller's id order; drop ids that no longer exist.
         by_id = {result.entry_id: result for result in results}
         return [by_id[entry_id] for entry_id in entry_ids if entry_id in by_id]
+
+    def find_by_field(
+        self,
+        field: str,
+        values: Sequence[str],
+    ) -> List[VectorStoreSearchResult]:
+        if not values or self.count() == 0:
+            return []
+        if not self._field_pattern.fullmatch(field):
+            raise ValueError(f"Invalid lookup field: {field!r}")
+
+        literals = ", ".join(self._quote(value) for value in values)
+        rows = self.table.search().where(f"{field} IN ({literals})").to_list()
+        return self._rows_to_results(rows)
 
     def update_metadata(self, entry_id: str, fields: Dict[str, Any]) -> None:
         if not fields:

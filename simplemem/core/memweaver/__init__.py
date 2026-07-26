@@ -9,6 +9,10 @@ Implements P0 and P1 of docs/memweaver-design.md section 8:
 * **P1** - context-inheriting embeddings (the vector layer carries the living
   thread summary as a prefix), semantically triggered re-embedding of the facts
   Call B names as outdated, and person-level entity profiles in the pool.
+* **P2** - one-hop evidence expansion along the fabric's own edges (supersede
+  chains both ways, weave edges, thread membership) with provenance, feeding a
+  flat cross-encoder rerank (``simplemem.core.reranker``, an inherited generic
+  component) and the supersede-chain annotation in the answer context.
 """
 
 from simplemem.core.memweaver.asof import (
@@ -24,6 +28,12 @@ from simplemem.core.memweaver.context import (
     contextual_embed_text,
 )
 from simplemem.core.memweaver.dates import parse_session_datetime, to_day
+from simplemem.core.memweaver.expansion import (
+    ExpandedPool,
+    Provenance,
+    expand_one_hop,
+    scoring_text,
+)
 from simplemem.core.memweaver.fabric import (
     FabricSnapshot,
     ThreadState,
@@ -56,6 +66,10 @@ __all__ = [
     "context_prefix",
     "contextual_embed_text",
     "context_digest",
+    "expand_one_hop",
+    "scoring_text",
+    "ExpandedPool",
+    "Provenance",
     "parse_session_datetime",
     "to_day",
 ]

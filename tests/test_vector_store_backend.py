@@ -174,6 +174,14 @@ class InMemoryVectorStoreBackend:
             if entry_id in by_id
         ]
 
+    def find_by_field(self, field, values):
+        wanted = set(values)
+        return [
+            self._result(record)
+            for record in self.records
+            if record.metadata.get(field) in wanted
+        ]
+
     def update_metadata(self, entry_id, fields):
         for record in self.records:
             if record.entry_id == entry_id:
@@ -223,6 +231,7 @@ class TrackingVectorStoreBackend:
             "structured_search": 0,
             "get_all": 0,
             "get_by_ids": 0,
+            "find_by_field": 0,
             "update_metadata": 0,
             "update_vector": 0,
             "delete_by_ids": 0,
@@ -258,6 +267,10 @@ class TrackingVectorStoreBackend:
     def get_by_ids(self, entry_ids):
         self.calls["get_by_ids"] += 1
         return self.delegate.get_by_ids(entry_ids)
+
+    def find_by_field(self, field, values):
+        self.calls["find_by_field"] += 1
+        return self.delegate.find_by_field(field, values)
 
     def update_metadata(self, entry_id, fields):
         self.calls["update_metadata"] += 1

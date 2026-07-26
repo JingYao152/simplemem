@@ -138,8 +138,24 @@ ENABLE_RECONTEXT = True
 # built by deterministic code from the threads a speaker takes part in.
 ENABLE_ENTITY_PROFILES = True
 
-# P2: one-hop evidence expansion + cross-encoder rerank.
-ENABLE_EXPAND_RERANK = False
+# P2: one-hop fabric expansion + flat cross-encoder rerank.
+# Expansion walks supersede chains, weave edges and thread membership one hop out
+# from every retrieved fact; the reranker then scores the whole expanded pool.
+# NOTE ON PARITY (design doc section 10): the reranker is an inherited generic
+# component, and every compared system is fitted with it before comparison. Keep
+# this True on BOTH arms for the main table; expansion is a no-op on the baseline
+# because there are no fabric edges to walk. The pure-SimpleMem reference number
+# is --no-memweaver --no-expand-rerank.
+ENABLE_EXPAND_RERANK = True
+
+# Entries kept after reranking, i.e. the answer context size. The only capacity
+# constant MemWeaver adds (design doc section 7); fixed, not tuned.
+RERANK_TOP_K = 20
+
+# Cross-encoder used for reranking (local inference, downloaded on first use).
+# A smaller model (e.g. BAAI/bge-reranker-base) is the documented cost lever on
+# CPU-only machines; it changes cost, not the method.
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # Temperature for every MemWeaver LLM call (thread assignment, thread update,
 # sweep judgement). Design doc section 6: one global value, and decision

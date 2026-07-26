@@ -49,7 +49,8 @@ class SimpleMemSystem:
         enable_weaving: Optional[bool] = None,
         enable_sweep: Optional[bool] = None,
         enable_recontext: Optional[bool] = None,
-        enable_entity_profiles: Optional[bool] = None
+        enable_entity_profiles: Optional[bool] = None,
+        enable_expand_rerank: Optional[bool] = None
     ):
         """
         Initialize system
@@ -75,6 +76,7 @@ class SimpleMemSystem:
         - enable_sweep: Enable the finalize cross-thread sweep (ablation switch, None=use config default)
         - enable_recontext: Enable context-inheriting embeddings + re-embedding (ablation switch, None=use config default)
         - enable_entity_profiles: Enable entity profiles in the pool (ablation switch, None=use config default)
+        - enable_expand_rerank: Enable one-hop expansion + cross-encoder rerank (ablation switch, None=use config default)
         """
         print("=" * 60)
         print("Initializing SimpleMem System")
@@ -144,12 +146,22 @@ class SimpleMemSystem:
             max_reflection_rounds=max_reflection_rounds,
             enable_parallel_retrieval=enable_parallel_retrieval,
             max_retrieval_workers=max_retrieval_workers,
-            enable_memweaver=self.enable_memweaver
+            enable_memweaver=self.enable_memweaver,
+            enable_expand_rerank=enable_expand_rerank
         )
 
+        # The supersede-chain annotation belongs to the same read-side stage as
+        # expansion + rerank, so it follows that switch.
         self.answer_generator = AnswerGenerator(
-            llm_client=self.llm_client
+            llm_client=self.llm_client,
+            annotate_chains=self.hybrid_retriever.enable_expand_rerank
         )
+        if self.hybrid_retriever.enable_expand_rerank:
+            print(
+                "One-hop expansion + rerank enabled "
+                f"(model={self.hybrid_retriever.reranker.model_name}, "
+                f"top_k={self.hybrid_retriever.reranker.top_k})"
+            )
 
         print("\nSystem initialization complete!")
         print("=" * 60)
@@ -268,7 +280,8 @@ def create_system(
     enable_weaving: Optional[bool] = None,
     enable_sweep: Optional[bool] = None,
     enable_recontext: Optional[bool] = None,
-    enable_entity_profiles: Optional[bool] = None
+    enable_entity_profiles: Optional[bool] = None,
+    enable_expand_rerank: Optional[bool] = None
 ) -> SimpleMemSystem:
     """
     Create SimpleMem system instance (uses config.py defaults when None)
@@ -286,7 +299,8 @@ def create_system(
         enable_weaving=enable_weaving,
         enable_sweep=enable_sweep,
         enable_recontext=enable_recontext,
-        enable_entity_profiles=enable_entity_profiles
+        enable_entity_profiles=enable_entity_profiles,
+        enable_expand_rerank=enable_expand_rerank
     )
 
 

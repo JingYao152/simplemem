@@ -4,7 +4,7 @@ Answer Generator - Final synthesis from retrieved contexts
 Section 3.3: Intent-Aware Retrieval Planning
 Generates answers from the merged context C_q after multi-view retrieval
 """
-from typing import List
+from typing import Dict, List, Optional
 from simplemem.core.models.memory_entry import MemoryEntry
 from simplemem.core.utils.llm_client import LLMClient
 from simplemem.core.settings import settings as config
@@ -15,9 +15,24 @@ class AnswerGenerator:
     Answer Generator - Synthesis from retrieved memory units (Section 3.3)
 
     Generates answers from C_q = R_sem ∪ R_lex ∪ R_sym
+
+    The prompt itself stays SimpleMem-native (no question-type formatting). With
+    ``annotate_chains`` on, members of a supersede chain are laid out next to each
+    other and marked "[SUPERSEDED on <date> by Context N]" - temporal questions
+    routinely ask what a fact used to be, and that reading requires knowing which
+    context replaced which (design doc section 5, contribution C3).
     """
-    def __init__(self, llm_client: LLMClient):
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        annotate_chains: Optional[bool] = None
+    ):
         self.llm_client = llm_client
+        self.annotate_chains = (
+            annotate_chains
+            if annotate_chains is not None
+            else getattr(config, 'ENABLE_EXPAND_RERANK', False)
+        )
 
     def generate_answer(self, query: str, contexts: List[MemoryEntry]) -> str:
         """
@@ -82,14 +97,86 @@ class AnswerGenerator:
                     else:
                         return "Failed to generate answer"
 
+    @staticmethod
+    def _order_supersede_chains(contexts: List[MemoryEntry]) -> List[MemoryEntry]:
+        """Lay each supersede chain out as a contiguous block, oldest first.
+
+        Chains converge: the cross-thread sweep can close several facts with the
+        same successor, so a successor may have more than one predecessor present.
+        All present predecessors are emitted (recursively) before it, which keeps
+        the whole chain contiguous and lets the annotation point forwards.
+
+        Only entries already in the context list are moved; nothing is added or
+        dropped. Without fabric validity fields this is the identity.
+        """
+        by_id = {entry.entry_id: entry for entry in contexts}
+        predecessors: Dict[str, List[MemoryEntry]] = {}
+        for entry in contexts:
+            if entry.superseded_by and entry.superseded_by in by_id:
+                predecessors.setdefault(entry.superseded_by, []).append(entry)
+        has_successor_present = {
+            entry.entry_id
+            for group in predecessors.values()
+            for entry in group
+        }
+
+        ordered: List[MemoryEntry] = []
+        placed = set()
+
+        def emit(entry: MemoryEntry) -> None:
+            if entry.entry_id in placed:
+                return
+            placed.add(entry.entry_id)  # set first: guards against cyclic links
+            for predecessor in predecessors.get(entry.entry_id, []):
+                emit(predecessor)
+            ordered.append(entry)
+
+        for entry in contexts:
+            # Enter each chain at its newest present member; predecessors follow
+            # from it, so every chain is emitted exactly once.
+            if entry.entry_id not in has_successor_present:
+                emit(entry)
+
+        # Cyclic links (never produced by the write side) keep their order.
+        ordered.extend(entry for entry in contexts if entry.entry_id not in placed)
+        return ordered
+
+    @staticmethod
+    def _chain_annotations(contexts: List[MemoryEntry]) -> Dict[str, str]:
+        """Map entry id -> "[SUPERSEDED on <date> by Context N]"."""
+        positions = {entry.entry_id: index for index, entry in enumerate(contexts, 1)}
+        annotations: Dict[str, str] = {}
+        for entry in contexts:
+            if not entry.valid_until:
+                continue
+            successor = positions.get(entry.superseded_by)
+            if successor is not None:
+                annotations[entry.entry_id] = (
+                    f"[SUPERSEDED on {entry.valid_until} by Context {successor}]"
+                )
+            else:
+                annotations[entry.entry_id] = (
+                    f"[NO LONGER TRUE as of {entry.valid_until}]"
+                )
+        return annotations
+
     def _format_contexts(self, contexts: List[MemoryEntry]) -> str:
         """
         Format contexts to readable text
         """
+        annotations: Dict[str, str] = {}
+        if self.annotate_chains and contexts:
+            contexts = self._order_supersede_chains(contexts)
+            annotations = self._chain_annotations(contexts)
+
         formatted = []
         for i, entry in enumerate(contexts, 1):
             parts = [f"[Context {i}]"]
-            parts.append(f"Content: {entry.lossless_restatement}")
+            content = entry.lossless_restatement
+            annotation = annotations.get(entry.entry_id)
+            if annotation:
+                content = f"{content} {annotation}"
+            parts.append(f"Content: {content}")
 
             if entry.timestamp:
                 parts.append(f"Time: {entry.timestamp}")

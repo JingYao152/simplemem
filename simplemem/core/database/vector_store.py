@@ -221,6 +221,20 @@ class VectorStore:
             return []
         return self._results_to_entries(self.backend.get_by_ids(entry_ids))
 
+    def find_by_field(self, field: str, values: List[str]) -> List[MemoryEntry]:
+        """Fetch entries whose ``field`` equals one of ``values``.
+
+        Empty values are dropped: an empty string is the *absence* of an edge, so
+        looking it up would match every entry that has no such edge.
+        """
+        if field not in self.METADATA_FIELDS:
+            raise ValueError(f"Unknown metadata field: {field!r}")
+
+        wanted = [value for value in dict.fromkeys(values or []) if value]
+        if not wanted:
+            return []
+        return self._results_to_entries(self.backend.find_by_field(field, wanted))
+
     def update_metadata(self, entry_id: str, fields: Dict[str, Any]) -> None:
         """Update metadata fields of a stored entry in place.
 

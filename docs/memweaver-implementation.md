@@ -1,11 +1,13 @@
-# MemWeaver 实现说明（P0 + P1）
+# MemWeaver 实现说明（P0 + P1 + P2）
 
-对应 `docs/memweaver-design.md` 第 8 节的前两个阶段：
+对应 `docs/memweaver-design.md` 第 8 节的三个阶段：
 
 - **P0**：数据模型 + 后端三能力 + Call A/B 写管线 + supersede 执行 + as-of 检索
   + finalize 兜底扫描（目标类别：cat2 时间题 321 题）
 - **P1**：上下文继承嵌入 + `outdated_facts` 重嵌入 + 实体档案入池
   （目标类别：cat1 单跳 282 题、cat4 开放域 841 题）
+- **P2**：一跳证据扩展 + 交叉编码器平铺精排 + supersede 链标注
+  （目标类别：cat3 多跳 96 题 + 全局）
 
 本文只记录"设计 → 代码"的落点、实现期做的判断，以及验证方式；设计本身以
 `memweaver-design.md` 为准。
@@ -28,13 +30,18 @@
 | **P1** 嵌入文本覆写（前缀只进向量）+ 原地重嵌入 | `vector_store.py` `add_entries(embed_texts=...)` / `reembed_entries`；后端 `update_vector` |
 | **P1** `outdated_facts` 触发的重上下文化 | `writer.py` `_recontextualize` |
 | **P1** 实体档案构建（确定性）与人物→线程归属 | `fabric.py` `build_entity_profile_entry` / `speaker_threads`；`writer.py` `_update_profiles` |
-| 检索侧 as-of 叠加 | `simplemem/core/hybrid_retriever.py` |
+| **P2** 一跳扩展（三类边 + provenance） | `simplemem/core/memweaver/expansion.py` |
+| **P2** 反向边查询（谁指向我） | `vector_store_backend.py` `find_by_field` |
+| **P2** 交叉编码器精排（继承组件，不在 memweaver/ 内） | `simplemem/core/reranker.py` |
+| **P2** supersede 链相邻排布 + `[SUPERSEDED ...]` 标注 | `simplemem/core/answer_generator.py` |
+| 检索侧 as-of 叠加 / 扩展 / 精排装配 | `simplemem/core/hybrid_retriever.py` |
 | 消融开关 / `LLM_TEMPERATURE` | `simplemem/core/settings.py`、`simplemem/core/config_default.py` |
 | 系统装配（写路由 + finalize） | `main.py` |
 | 评测：A/B 同 harness + evidence 检索命中率 | `test_locomo10.py`、`locomo_evidence.py` |
 
-单元测试：`tests/test_memweaver.py`（63 例，全部 LLM 调用脚本化，覆盖每个
-决策点的确定性兜底、P1 的前缀不落库/指纹幂等/档案重写）、
+单元测试：`tests/test_memweaver.py`（91 例，全部 LLM 调用脚本化与交叉编码器
+桩化，覆盖每个决策点的确定性兜底、P1 的前缀不落库/指纹幂等/档案重写、
+P2 的三类边/一跳边界/provenance 打分/精排降级/链式排布）、
 `tests/test_evidence_retrieval.py`（12 例）。
 
 ## 2. 参数账本
@@ -48,6 +55,8 @@
 | `SWEEP_SCAN_DEPTH` | 12 | 为拿到 3 个跨线程近邻而多取的行数，纯实现细节 |
 | `SWEEP_BATCH_SIZE` | 20 | 判定 prompt 的分批大小；所有候选对都会被判定，不改变任何决策 |
 | `CONTEXT_PREFIX_MAX_CHARS` | 200 | P1 上下文前缀的渲染长度上限，格式常数（同 `ThreadState.one_line()` 的 240） |
+| `RERANK_TOP_K` | 20 | **设计第 7 节唯一的容量常数**：精排后进入回答上下文的条目数 |
+| `RERANK_BATCH_SIZE` | 32 | 交叉编码器每次前向的对数，纯 plumbing，不改变任何打分 |
 | `_ABBREVIATION_MAX_LEN` | 3 | 判定"句号属于缩写而非句末"的词长阈值，格式启发式 |
 | `EVIDENCE_HIT_THRESHOLD` | 0.3 | **评测侧**命中判定阈值，不属于系统参数 |
 
@@ -109,7 +118,33 @@
    一行里。前缀嵌入与实体档案是两个独立机制、贡献可分离，故拆成
    `ENABLE_RECONTEXT`（前缀 + 重嵌入）与 `ENABLE_ENTITY_PROFILES`（档案入池）
    两个开关。两者都为 True 时等于设计描述的 P1 全量行为。
-13. **全文索引失效修复**（`vector_store_backend.py`）：LanceDB 的 FTS 索引不随写入
+13. **P2 反向边需要一个新的存储原语**：weave 边在 P0 就双向写入，所以顺着
+   `links` 用 `get_by_ids` 就够；线程摘要 ID 固定（`thread::<tid>`）也不用查询。
+   唯一缺的是"谁 supersede 了我"——`superseded_by` 只在旧条目上单向存在，而设计
+   要求 supersede 链**双向**遍历（时间题问"之前是什么"正需要反向）。因此后端补
+   `find_by_field(field, values)`。facade 层会丢掉空值：空串代表"没有这条边"，
+   拿空串去查会命中所有没有该边的条目（基线数据全中）。
+14. **扩展后的条目不再过 as-of 过滤**：as-of 的作用域是检索基座产出的候选池；
+   一跳扩展沿 supersede 链把历史**故意**取回来，此时再套一遍有效期过滤就把扩展
+   本身抵消了。这带来一个 P0 性质的**有意变更**：非 when 类问题现在也可能看到
+   已闭合的事实，但它们带 provenance 进池、并在回答上下文里被标注为
+   `[SUPERSEDED on <d> by Context N]`。P0 阶段那条"状态题看不到过期事实"的
+   测试因此被限定到"关闭 P2 时"的语义，另有 P2 测试钉住新语义。
+15. **精排器放在 `memweaver/` 之外**：设计第 10 节把它标为继承组件、不进贡献
+   声明，且 baseline parity 要求所有对照系统都配同一个精排器。因此
+   `simplemem/core/reranker.py` 完全不认识织物，`ENABLE_EXPAND_RERANK` 也**不**
+   受 `ENABLE_MEMWEAVER` 约束——基线 arm 打开它就是"基线 + 精排"，因为基线数据
+   没有织物边可走，扩展自然是空操作。**主表两个 arm 都应打开它**；纯 SimpleMem
+   的参照数字是 `--no-memweaver --no-expand-rerank`。
+16. **精排不可用时确定性降级**：模型加载失败（无 sentence-transformers、模型主机
+   不可达）只报告一次，之后保持检索顺序并仍然截断到 `RERANK_TOP_K`——这样容量
+   常数在两条路径下都成立，跑批不会因为环境缺模型而中断。
+17. **supersede 链会汇聚，排布要按块**：兜底扫描可以用同一条新事实闭合多条旧
+   事实，所以一个后继可能有多个前驱。排布实现为"把在场的前驱（递归）全部排在
+   后继之前"，于是整条链是连续块、后继在块尾，标注的 `Context N` 指向真实位置。
+   实测样本上 20 条上下文里有 6 个连续块。环形链（写侧不产生）保持原序、不递归
+   死循环。
+18. **全文索引失效修复**（`vector_store_backend.py`）：LanceDB 的 FTS 索引不随写入
    增量更新，原实现只在首次 insert 时建索引。基线一次性批量写入时无感，但
    MemWeaver 每 session 写一次，会导致只有第 1 个 session 的事实进入词法路。
    改为"写入/更新/删除标脏 → 下次词法检索前重建"，两个 arm 共享此修复，
@@ -126,7 +161,9 @@
 | `ENABLE_SWEEP` | `True` | P0：finalize 跨线程 supersede 扫描 |
 | `ENABLE_RECONTEXT` | `True` | P1：上下文继承嵌入 + `outdated_facts` 重嵌入。关掉 = 纯 SimpleMem 单句嵌入 |
 | `ENABLE_ENTITY_PROFILES` | `True` | P1：实体档案（`profile::<name>`）入池 |
-| `ENABLE_EXPAND_RERANK` | `False` | **P2 占位**，当前无实现 |
+| `ENABLE_EXPAND_RERANK` | `True` | P2：一跳扩展 + 交叉编码器精排 + 链标注。**不**受 `ENABLE_MEMWEAVER` 约束（parity：基线 arm 也配同一精排器） |
+| `RERANK_TOP_K` | `20` | 精排后进入回答上下文的条目数（容量常数） |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | 本地交叉编码器；CPU 上可换 `bge-reranker-base` 降成本 |
 | `LLM_TEMPERATURE` | `0.7` | MemWeaver 全部 LLM 调用统一温度 |
 
 启用 MemWeaver 时必须禁用 EvolveMem 的 `time_decay_half_life_days`
@@ -137,19 +174,24 @@
 ```bash
 python scripts/fetch_locomo10.py                      # -> test_ref/locomo10.json
 
-# Arm A：纯 SimpleMem 基线
+# Arm A：基线 + 同一个精排器（parity 要求，设计第 10 节）
 python test_locomo10.py --no-memweaver --llm-judge --parallel-questions \
     --result-file results/baseline_run1.json
 
-# Arm B：MemWeaver（P0 + P1）
+# Arm B：MemWeaver（P0 + P1 + P2）
 python test_locomo10.py --memweaver --llm-judge --parallel-questions \
     --result-file results/memweaver_run1.json
+
+# 纯 SimpleMem 参照数字（不配精排器）
+python test_locomo10.py --no-memweaver --no-expand-rerank --llm-judge \
+    --parallel-questions --result-file results/simplemem_pure.json
 
 # 消融（每项对应论文消融表一行）
 python test_locomo10.py --memweaver --no-weaving   --result-file results/mw_no_weaving.json
 python test_locomo10.py --memweaver --no-sweep     --result-file results/mw_no_sweep.json
 python test_locomo10.py --memweaver --no-recontext --result-file results/mw_no_recontext.json
 python test_locomo10.py --memweaver --no-profiles  --result-file results/mw_no_profiles.json
+python test_locomo10.py --memweaver --no-expand-rerank --result-file results/mw_no_expand_rerank.json
 
 # 对比（温度 0.7 → 每 arm 跑 3 次，脚本按 arm 聚合 mean±std）
 python scripts/compare_locomo_results.py \
@@ -197,8 +239,21 @@ evidence，因此按词法对齐，并按**对话自身的 IDF** 加权：某条
 | `profiles_written` | 实际写入的档案行数 |
 | `profiles_unchanged` | 该说话人参与的线程本 session 没变、因此跳过重写的次数 |
 
-## 8. 尚未实现（按设计留给 P2）
+## 8. 读侧成本（P2 引入，跑之前要知道）
 
-- 一跳证据扩展（supersede 链双向、weave 边双向、结构归属边）；
-- 交叉编码器平铺精排（`RERANK_TOP_K=20`）与扩展条目的 provenance 前缀打分；
-- supersede 链在回答上下文中的相邻排布与 `[SUPERSEDED on <d> by Context N]` 标注。
+精排是本方案唯一的重本地计算：候选池 = 基座输出（多查询 + 反思，实测 25–100 条）
++ 一跳扩展（实测 +15~20 条），全池逐条过交叉编码器。设计明确要求"扩展后全池
+逐条打分"，所以没有截断参数；代价是每题一次 40–150 对的 cross-encoder 前向。
+
+- 4 核 CPU、无 GPU 时 `bge-reranker-v2-m3`（568M）每题约数秒；196 题 × 2 arm
+  会显著拉长墙钟时间。降成本的**唯一**旋钮是换小模型
+  （`RERANKER_MODEL=BAAI/bge-reranker-base`），它改成本不改方法。
+- 环境拿不到模型时自动降级为"保持检索顺序 + 截断到 top-20"，日志里会说一次；
+  此时 P2 的贡献只剩一跳扩展。
+
+## 9. 尚未实现
+
+设计第 8 节的三个阶段已全部落地。设计中明确"暂缓/移出"的读侧候选仍未实现，
+按设计保持移出：RRF 融合、符号路日期窗口化与 person 过滤禁用、题型格式化
+prompt、充分性门控（见设计第 5 节暂缓清单）。第 11 节的 LongMemEval 适配同样
+未开始（question_date 锚、`_abs` 弃答、`_m` 规模的摘要预筛）。

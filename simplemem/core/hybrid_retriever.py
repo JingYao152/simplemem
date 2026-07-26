@@ -16,6 +16,8 @@ from simplemem.core.memweaver.asof import (
     compute_anchor,
     is_temporal_history_question,
 )
+from simplemem.core.memweaver.expansion import expand_one_hop, scoring_text
+from simplemem.core.reranker import CrossEncoderReranker
 from simplemem.core.settings import settings as config
 import re
 from datetime import datetime, timedelta
@@ -47,7 +49,9 @@ class HybridRetriever:
         max_reflection_rounds: int = 2,
         enable_parallel_retrieval: bool = True,
         max_retrieval_workers: int = 3,
-        enable_memweaver: Optional[bool] = None
+        enable_memweaver: Optional[bool] = None,
+        enable_expand_rerank: Optional[bool] = None,
+        reranker: Optional[CrossEncoderReranker] = None
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
@@ -63,6 +67,17 @@ class HybridRetriever:
             else getattr(config, 'ENABLE_MEMWEAVER', False)
         )
         self._anchor_cache: Optional[tuple] = None
+
+        # P2: one-hop fabric expansion + cross-encoder flat rerank. Independent of
+        # enable_memweaver on purpose - the baseline arm is fitted with the same
+        # reranker for parity (design doc section 10), where expansion finds
+        # nothing because there are no fabric edges to walk.
+        self.enable_expand_rerank = (
+            enable_expand_rerank
+            if enable_expand_rerank is not None
+            else getattr(config, 'ENABLE_EXPAND_RERANK', False)
+        )
+        self.reranker = reranker or CrossEncoderReranker()
 
         # Use config values as default if not explicitly provided
         self.enable_planning = enable_planning if enable_planning is not None else getattr(config, 'ENABLE_PLANNING', True)
@@ -84,9 +99,10 @@ class HybridRetriever:
         """
         if self.enable_planning:
             return self._retrieve_with_planning(query, enable_reflection)
-        else:
-            # Fallback to simple semantic search
-            return self._semantic_search(query, as_of=self._resolve_as_of(query))
+
+        # Fallback to simple semantic search
+        results = self._semantic_search(query, as_of=self._resolve_as_of(query))
+        return self._expand_and_rerank(query, results)
 
     # ------------------------------------------------------------------
     # As-of retrieval (MemWeaver C3, design doc section 5)
@@ -192,7 +208,47 @@ class HybridRetriever:
                 query, merged_results, information_plan, as_of=as_of
             )
 
-        return merged_results
+        # Step 6: one-hop fabric expansion + flat cross-encoder rerank (P2)
+        return self._expand_and_rerank(query, merged_results)
+
+    # ------------------------------------------------------------------
+    # One-hop expansion + rerank (design doc section 5)
+    # ------------------------------------------------------------------
+
+    def _expand_and_rerank(
+        self,
+        query: str,
+        candidates: List[MemoryEntry]
+    ) -> List[MemoryEntry]:
+        """Walk the fabric one hop, then score the whole pool and keep top-k.
+
+        Expanded entries are deliberately *not* re-filtered by the as-of anchor:
+        walking a supersede chain is how history is recovered, so re-applying the
+        validity filter here would undo the expansion.
+        """
+        if not self.enable_expand_rerank or not candidates:
+            return candidates
+
+        pool = expand_one_hop(self.vector_store, candidates)
+        added = len(pool.entries) - len(candidates)
+        if added:
+            print(
+                f"[Expand] +{added} one-hop entries "
+                f"({', '.join(f'{edge}:{count}' for edge, count in sorted(pool.counts().items()))})"
+            )
+
+        ranked, reranked = self.reranker.rerank(
+            query,
+            pool.entries,
+            to_text=lambda entry: scoring_text(
+                entry, pool.provenance.get(entry.entry_id)
+            ),
+        )
+        print(
+            f"[Rerank] {len(pool.entries)} candidates -> {len(ranked)} contexts"
+            + ("" if reranked else " (model unavailable: retrieval order kept)")
+        )
+        return ranked
 
     def _retrieve_with_reflection(self, query: str, initial_results: List[MemoryEntry], as_of: str = "") -> List[MemoryEntry]:
         """

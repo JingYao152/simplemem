@@ -6,6 +6,10 @@
 # Defaults to sample 0 only, 3 repeats per arm (MemWeaver decides at
 # temperature 0.7, so single runs are not comparable - report mean +/- std).
 #
+# Both arms run with the same cross-encoder reranker, which is the baseline parity
+# discipline from the design doc (section 10). --ablations additionally runs the
+# per-mechanism rows, including --no-expand-rerank.
+#
 # Requires OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL in the environment.
 set -euo pipefail
 
@@ -71,6 +75,16 @@ if [[ "$ABLATIONS" == "1" ]]; then
     python test_locomo10.py "${COMMON[@]}" --memweaver --no-profiles \
         --result-file "$OUT/mw_no_profiles.json" 2>&1 \
         | tee "$OUT/mw_no_profiles.log" | tail -40
+
+    echo "== ablation: no expansion / no rerank =="
+    python test_locomo10.py "${COMMON[@]}" --memweaver --no-expand-rerank \
+        --result-file "$OUT/mw_no_expand_rerank.json" 2>&1 \
+        | tee "$OUT/mw_no_expand_rerank.log" | tail -40
+
+    echo "== reference: pure SimpleMem (no reranker) =="
+    python test_locomo10.py "${COMMON[@]}" --no-memweaver --no-expand-rerank \
+        --result-file "$OUT/simplemem_pure.json" 2>&1 \
+        | tee "$OUT/simplemem_pure.log" | tail -40
 fi
 
 echo "== comparison =="
@@ -79,7 +93,7 @@ python scripts/compare_locomo_results.py \
     | tee "$OUT/comparison.txt"
 
 if [[ "$ABLATIONS" == "1" ]]; then
-    for ablation in no_weaving no_sweep no_recontext no_profiles; do
+    for ablation in no_weaving no_sweep no_recontext no_profiles no_expand_rerank; do
         echo "== comparison: memweaver vs $ablation =="
         python scripts/compare_locomo_results.py \
             "$OUT"/memweaver_run*.json --memweaver "$OUT/mw_$ablation.json" \

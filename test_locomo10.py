@@ -1015,7 +1015,12 @@ Return ONLY the JSON, no other text.
         """Which A/B arm this run is: MemWeaver (with ablations) or baseline."""
         weaver = getattr(self.system, 'memweaver', None)
         if weaver is None:
-            return 'simplemem-baseline'
+            reranked = getattr(
+                getattr(self.system, 'hybrid_retriever', None),
+                'enable_expand_rerank',
+                False,
+            )
+            return 'simplemem-baseline' + (' (+rerank)' if reranked else '')
         flags = []
         if not weaver.enable_weaving:
             flags.append('no-weaving')
@@ -1025,6 +1030,8 @@ Return ONLY the JSON, no other text.
             flags.append('no-recontext')
         if not weaver.enable_entity_profiles:
             flags.append('no-profiles')
+        if not self.system.hybrid_retriever.enable_expand_rerank:
+            flags.append('no-expand-rerank')
         return 'memweaver' + (f" ({', '.join(flags)})" if flags else '')
 
     def run_test(self, num_samples: int = None, save_results: bool = True, result_file: str = 'locomo10_test_results.json', enable_parallel_questions: bool = False):
@@ -1129,6 +1136,12 @@ Return ONLY the JSON, no other text.
                         'num_questions': len(all_results),
                         'arm': self.arm_name(),
                         'memweaver': bool(getattr(self.system, 'enable_memweaver', False)),
+                        'expand_rerank': bool(
+                            getattr(self.system.hybrid_retriever, 'enable_expand_rerank', False)
+                        ),
+                        'rerank_top_k': getattr(
+                            self.system.hybrid_retriever.reranker, 'top_k', None
+                        ),
                         'avg_retrieval_time': sum(self.retrieval_times)/len(self.retrieval_times),
                         'avg_answer_time': sum(self.answer_times)/len(self.answer_times),
                         'avg_total_time': sum(self.total_times)/len(self.total_times),
@@ -1181,6 +1194,11 @@ def main():
                        help='Ablation: embed facts as bare sentences (no thread-context prefix)')
     parser.add_argument('--no-profiles', dest='profiles', action='store_false', default=None,
                        help='Ablation: do not write entity profiles into the pool')
+    parser.add_argument('--no-expand-rerank', dest='expand_rerank', action='store_false', default=None,
+                       help='Ablation: no one-hop expansion and no cross-encoder rerank. '
+                            'NOTE: for the main table keep the reranker on BOTH arms '
+                            '(baseline parity); use this for the ablation row and for '
+                            'the pure-SimpleMem reference number.')
 
     args = parser.parse_args()
 
@@ -1192,7 +1210,8 @@ def main():
         enable_weaving=args.weaving,
         enable_sweep=args.sweep,
         enable_recontext=args.recontext,
-        enable_entity_profiles=args.profiles
+        enable_entity_profiles=args.profiles,
+        enable_expand_rerank=args.expand_rerank
     )
 
     # The ablations only mean something on the MemWeaver arm; say so loudly

@@ -16,6 +16,7 @@ from simplemem.core.database.vector_store_backend import (
     FieldPredicate,
     LanceDBVectorStoreBackend,
 )
+from simplemem.core.answer_generator import AnswerGenerator
 from simplemem.core.hybrid_retriever import HybridRetriever
 from simplemem.core.memweaver import MemWeaver
 from simplemem.core.memweaver.asof import (
@@ -31,6 +32,13 @@ from simplemem.core.memweaver.context import (
     contextual_embed_text,
 )
 from simplemem.core.memweaver.dates import parse_session_datetime, to_day
+from simplemem.core.memweaver.expansion import (
+    EDGE_SUPERSEDED_BY,
+    EDGE_SUPERSEDES,
+    EDGE_THREAD,
+    expand_one_hop,
+    scoring_text,
+)
 from simplemem.core.memweaver.fabric import ThreadState, load_fabric, speaker_threads
 from simplemem.core.models.memory_entry import (
     KIND_ENTITY_PROFILE,
@@ -39,6 +47,7 @@ from simplemem.core.models.memory_entry import (
     Dialogue,
     MemoryEntry,
 )
+from simplemem.core.reranker import CrossEncoderReranker
 from simplemem.core.utils.llm_client import LLMClient
 
 
@@ -1112,6 +1121,9 @@ def _retriever(store, **kwargs):
     kwargs.setdefault("enable_reflection", False)
     kwargs.setdefault("enable_parallel_retrieval", False)
     kwargs.setdefault("enable_memweaver", True)
+    # These tests are about the retrieval base; P2 expansion/rerank is opted into
+    # explicitly by the tests that cover it.
+    kwargs.setdefault("enable_expand_rerank", False)
     return HybridRetriever(
         llm_client=ScriptedLLM(), vector_store=store, **kwargs
     )
@@ -1744,3 +1756,394 @@ def test_unchanged_profile_is_not_rewritten(store):
     ]
     assert len(profiles) == 1
     assert profiles[0].valid_from == "2023-05-01", "kept row keeps its own date"
+
+
+# ----------------------------------------------------------------------
+# P2 - one-hop expansion (design doc section 5)
+# ----------------------------------------------------------------------
+
+
+def _seed_fabric_neighbourhood(store):
+    """A supersede chain, a bridge edge, a thread summary and an unrelated fact."""
+    store.add_entries(
+        [
+            MemoryEntry(
+                entry_id="old",
+                lossless_restatement="Alice drinks coffee every morning",
+                thread_id="t1",
+                valid_from="2023-05-01",
+                valid_until="2023-06-08",
+                superseded_by="current",
+            ),
+            MemoryEntry(
+                entry_id="current",
+                lossless_restatement="Alice stopped drinking coffee",
+                thread_id="t1",
+                valid_from="2023-06-08",
+                links=["bridge:bridged"],
+            ),
+            MemoryEntry(
+                entry_id="bridged",
+                lossless_restatement="Melanie brought pottery mugs to the studio",
+                thread_id="t2",
+                valid_from="2023-06-01",
+                links=["bridge:current"],
+            ),
+            MemoryEntry(
+                entry_id=MemoryEntry.thread_summary_id("t1"),
+                lossless_restatement="Alice's coffee habit and how it ended",
+                topic="Coffee habit",
+                kind=KIND_THREAD_SUMMARY,
+                thread_id="t1",
+                # A later session, so the anchor is strictly after the closure and
+                # "old" really is filtered out of the base pool.
+                valid_from="2023-07-05",
+            ),
+            MemoryEntry(
+                entry_id="unrelated",
+                lossless_restatement="Nate repaired a tractor",
+                thread_id="t3",
+                valid_from="2023-05-05",
+            ),
+        ]
+    )
+
+
+def test_one_hop_expansion_walks_every_edge_type(store):
+    _seed_fabric_neighbourhood(store)
+    anchor = store.get_by_ids(["current"])
+
+    pool = expand_one_hop(store, anchor)
+
+    by_id = {entry.entry_id: entry for entry in pool.entries}
+    assert set(by_id) == {"current", "old", "bridged", "thread::t1"}
+    assert "unrelated" not in by_id
+    # supersede chain backwards, weave edge, structural membership
+    assert pool.provenance["old"].edge == EDGE_SUPERSEDES
+    assert pool.provenance["old"].anchor_id == "current"
+    assert pool.provenance["bridged"].edge == "bridge"
+    assert pool.provenance["thread::t1"].edge == EDGE_THREAD
+    assert "current" not in pool.provenance, "anchors carry no provenance"
+    assert pool.counts() == {EDGE_SUPERSEDES: 1, "bridge": 1, EDGE_THREAD: 1}
+
+
+def test_one_hop_expansion_follows_the_chain_forwards(store):
+    _seed_fabric_neighbourhood(store)
+
+    pool = expand_one_hop(store, store.get_by_ids(["old"]))
+
+    assert pool.provenance["current"].edge == EDGE_SUPERSEDED_BY
+    assert pool.provenance["current"].anchor_id == "old"
+
+
+def test_expansion_is_one_hop_only(store):
+    _seed_fabric_neighbourhood(store)
+    store.add_entries(
+        [
+            MemoryEntry(
+                entry_id="two_hops",
+                lossless_restatement="A pottery kiln was installed",
+                thread_id="t2",
+                valid_from="2023-06-02",
+                links=["refine:bridged"],
+            )
+        ]
+    )
+    store.update_metadata("bridged", {"links": ["bridge:current", "refine:two_hops"]})
+
+    pool = expand_one_hop(store, store.get_by_ids(["current"]))
+
+    # "bridged" arrives (one hop); its own neighbour does not.
+    assert "bridged" in pool.provenance
+    assert "two_hops" not in {entry.entry_id for entry in pool.entries}
+
+
+def test_summaries_and_profiles_are_not_expanded_outwards(store):
+    _seed_fabric_neighbourhood(store)
+    summary = store.get_by_ids([MemoryEntry.thread_summary_id("t1")])
+
+    pool = expand_one_hop(store, summary)
+
+    assert [entry.entry_id for entry in pool.entries] == ["thread::t1"]
+    assert pool.provenance == {}
+
+
+def test_expansion_is_inert_on_baseline_entries(store):
+    """No fabric fields means nothing to walk - and no empty-string match."""
+    store.add_entries(
+        [
+            MemoryEntry(entry_id="b1", lossless_restatement="Alice drinks coffee"),
+            MemoryEntry(entry_id="b2", lossless_restatement="Melanie paints"),
+        ]
+    )
+
+    pool = expand_one_hop(store, store.get_by_ids(["b1"]))
+
+    assert [entry.entry_id for entry in pool.entries] == ["b1"]
+    assert pool.provenance == {}
+
+
+def test_find_by_field_drops_empty_values_and_guards_the_field(store):
+    _seed_fabric_neighbourhood(store)
+
+    assert [e.entry_id for e in store.find_by_field("superseded_by", ["current"])] == [
+        "old"
+    ]
+    # An empty value is the absence of an edge, not a wildcard.
+    assert store.find_by_field("superseded_by", ["", None]) == []
+    with pytest.raises(ValueError, match="Unknown metadata field"):
+        store.find_by_field("not_a_field", ["x"])
+    with pytest.raises(ValueError, match="Invalid lookup field"):
+        store.backend.find_by_field("superseded_by = 'x' OR TRUE", ["y"])
+
+
+def test_scoring_text_prefixes_only_expanded_entries(store):
+    _seed_fabric_neighbourhood(store)
+    pool = expand_one_hop(store, store.get_by_ids(["current"]))
+    by_id = {entry.entry_id: entry for entry in pool.entries}
+
+    anchor_text = scoring_text(by_id["current"], pool.provenance.get("current"))
+    bridged_text = scoring_text(by_id["bridged"], pool.provenance.get("bridged"))
+
+    assert anchor_text == "Alice stopped drinking coffee"
+    assert bridged_text == (
+        "[bridge of: Alice stopped drinking coffee] "
+        "Melanie brought pottery mugs to the studio"
+    )
+
+
+# ----------------------------------------------------------------------
+# P2 - cross-encoder rerank
+# ----------------------------------------------------------------------
+
+
+class FakeCrossEncoder:
+    """Scores by keyword overlap, and records what it was asked to score."""
+
+    def __init__(self, *args, **kwargs):
+        self.pairs = []
+
+    def predict(self, pairs):
+        self.pairs.extend(pairs)
+        scores = []
+        for query, document in pairs:
+            wanted = set(query.lower().split())
+            scores.append(
+                len(wanted & set(document.lower().split())) / max(len(wanted), 1)
+            )
+        return scores
+
+
+def _fake_reranker(top_k=20):
+    encoder = FakeCrossEncoder()
+    reranker = CrossEncoderReranker(
+        top_k=top_k, model_factory=lambda name: encoder
+    )
+    return reranker, encoder
+
+
+def test_reranker_orders_by_score_and_applies_top_k():
+    reranker, encoder = _fake_reranker(top_k=2)
+    documents = ["nothing relevant here", "pottery class signup", "pottery mugs"]
+
+    ranked, reranked = reranker.rerank(
+        "pottery mugs", documents, to_text=lambda text: text
+    )
+
+    assert reranked is True
+    assert ranked == ["pottery mugs", "pottery class signup"]
+    assert len(encoder.pairs) == 3, "flat scoring: every candidate is scored once"
+
+
+def test_reranker_falls_back_to_retrieval_order_when_unavailable():
+    def explode(name):
+        raise RuntimeError("no model here")
+
+    reranker = CrossEncoderReranker(top_k=2, model_factory=explode)
+    documents = ["first", "second", "third"]
+
+    ranked, reranked = reranker.rerank("query", documents, to_text=lambda t: t)
+
+    assert reranked is False
+    assert ranked == ["first", "second"], "top_k still applies"
+    # The failure is recorded once, not per query.
+    reranker.rerank("query", documents, to_text=lambda t: t)
+    assert reranker._unavailable is True
+    assert reranker.available is False
+
+
+def test_reranker_scores_expanded_entries_with_their_provenance(store):
+    _seed_fabric_neighbourhood(store)
+    reranker, encoder = _fake_reranker()
+    retriever = _retriever(
+        store, semantic_top_k=10, enable_expand_rerank=True, reranker=reranker
+    )
+
+    results = retriever.retrieve("Does Alice drink coffee?")
+
+    scored = [document for _, document in encoder.pairs]
+    # "old" is the entry the as-of filter removed and the chain edge brought back,
+    # so it is the one carrying a provenance prefix here.
+    assert (
+        "[supersedes of: Alice stopped drinking coffee] "
+        "Alice drinks coffee every morning"
+    ) in scored
+    # Entries the base retrieval already found are scored on their bare text.
+    assert "Alice stopped drinking coffee" in scored
+    assert "Melanie brought pottery mugs to the studio" in scored
+    # Flat rerank: every candidate in the pool is scored exactly once.
+    assert len(scored) == len(set(scored)) == len(results)
+
+
+def test_expand_rerank_disabled_returns_the_base_pool(store):
+    _seed_fabric_neighbourhood(store)
+    reranker, encoder = _fake_reranker()
+    retriever = _retriever(
+        store, semantic_top_k=10, enable_expand_rerank=False, reranker=reranker
+    )
+
+    results = retriever.retrieve("Does Alice drink coffee?")
+
+    assert encoder.pairs == []
+    assert "old" not in {entry.entry_id for entry in results}
+
+
+def test_state_question_recovers_history_through_expansion(store):
+    """P2 changes the P0 property on purpose: history returns, annotated."""
+    _seed_fabric_neighbourhood(store)
+    reranker, _ = _fake_reranker()
+    retriever = _retriever(
+        store, semantic_top_k=10, enable_expand_rerank=True, reranker=reranker
+    )
+
+    results = retriever.retrieve("Does Alice drink coffee?")
+    ids = {entry.entry_id for entry in results}
+
+    # The as-of filter kept "old" out of the base pool; the chain edge brought it
+    # back, which is what the answer-side annotation is for.
+    assert "current" in ids and "old" in ids
+
+
+# ----------------------------------------------------------------------
+# P2 - supersede chain annotation in the answer context
+# ----------------------------------------------------------------------
+
+
+def _generator(annotate=True):
+    return AnswerGenerator(llm_client=ScriptedLLM(), annotate_chains=annotate)
+
+
+def _chain_contexts():
+    return [
+        MemoryEntry(
+            entry_id="unrelated",
+            lossless_restatement="Nate repaired a tractor",
+            valid_from="2023-05-05",
+        ),
+        MemoryEntry(
+            entry_id="current",
+            lossless_restatement="Alice stopped drinking coffee",
+            valid_from="2023-06-08",
+        ),
+        MemoryEntry(
+            entry_id="old",
+            lossless_restatement="Alice drinks coffee every morning",
+            valid_from="2023-05-01",
+            valid_until="2023-06-08",
+            superseded_by="current",
+        ),
+    ]
+
+
+def test_chain_members_are_placed_adjacently_oldest_first():
+    ordered = AnswerGenerator._order_supersede_chains(_chain_contexts())
+
+    assert [entry.entry_id for entry in ordered] == ["unrelated", "old", "current"]
+
+
+def test_superseded_context_is_annotated_with_its_successor_position():
+    formatted = _generator()._format_contexts(_chain_contexts())
+
+    assert "[SUPERSEDED on 2023-06-08 by Context 3]" in formatted
+    # The annotation points at the position the successor actually occupies.
+    assert formatted.index("[Context 2]") < formatted.index("[SUPERSEDED")
+    assert "Alice stopped drinking coffee" in formatted.split("[Context 3]")[1]
+
+
+def test_closed_fact_without_its_successor_is_still_marked_stale():
+    contexts = [
+        MemoryEntry(
+            entry_id="old",
+            lossless_restatement="Alice drinks coffee every morning",
+            valid_from="2023-05-01",
+            valid_until="2023-06-08",
+            superseded_by="absent",
+        )
+    ]
+
+    formatted = _generator()._format_contexts(contexts)
+
+    assert "[NO LONGER TRUE as of 2023-06-08]" in formatted
+
+
+def test_annotation_disabled_keeps_the_native_context_format():
+    formatted = _generator(annotate=False)._format_contexts(_chain_contexts())
+
+    assert "SUPERSEDED" not in formatted
+    assert "NO LONGER TRUE" not in formatted
+    # Original order preserved.
+    assert formatted.index("Nate repaired") < formatted.index("Alice stopped")
+
+
+def test_annotation_is_inert_without_fabric_fields():
+    contexts = [
+        MemoryEntry(entry_id="b1", lossless_restatement="Alice drinks coffee"),
+        MemoryEntry(entry_id="b2", lossless_restatement="Melanie paints"),
+    ]
+
+    formatted = _generator()._format_contexts(contexts)
+
+    assert "SUPERSEDED" not in formatted
+    assert AnswerGenerator._order_supersede_chains(contexts) == contexts
+
+
+def test_converging_chains_stay_contiguous():
+    """The sweep can close several facts with the same successor."""
+    contexts = [
+        MemoryEntry(entry_id="a", lossless_restatement="Alice drank filter coffee",
+                    valid_from="2023-05-01", valid_until="2023-06-08",
+                    superseded_by="now"),
+        MemoryEntry(entry_id="filler", lossless_restatement="Nate repaired a tractor",
+                    valid_from="2023-05-05"),
+        MemoryEntry(entry_id="now", lossless_restatement="Alice stopped drinking coffee",
+                    valid_from="2023-06-08"),
+        MemoryEntry(entry_id="b", lossless_restatement="Alice drank espresso at work",
+                    valid_from="2023-05-03", valid_until="2023-06-08",
+                    superseded_by="now"),
+    ]
+
+    ordered = AnswerGenerator._order_supersede_chains(contexts)
+    positions = {entry.entry_id: index for index, entry in enumerate(ordered)}
+
+    assert len(ordered) == len(contexts)
+    # Both predecessors sit immediately before their shared successor.
+    block = sorted(positions[key] for key in ("a", "b", "now"))
+    assert block == list(range(block[0], block[0] + 3))
+    assert positions["now"] == block[-1], "successor last in its block"
+
+    formatted = _generator()._format_contexts(contexts)
+    successor_context = positions["now"] + 1
+    assert formatted.count(f"[SUPERSEDED on 2023-06-08 by Context {successor_context}]") == 2
+
+
+def test_cyclic_links_do_not_hang_the_layout():
+    contexts = [
+        MemoryEntry(entry_id="x", lossless_restatement="one",
+                    valid_until="2023-06-01", superseded_by="y"),
+        MemoryEntry(entry_id="y", lossless_restatement="two",
+                    valid_until="2023-06-02", superseded_by="x"),
+    ]
+
+    ordered = AnswerGenerator._order_supersede_chains(contexts)
+
+    assert [entry.entry_id for entry in ordered] == ["x", "y"]

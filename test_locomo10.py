@@ -1021,6 +1021,10 @@ Return ONLY the JSON, no other text.
             flags.append('no-weaving')
         if not weaver.enable_sweep:
             flags.append('no-sweep')
+        if not weaver.enable_recontext:
+            flags.append('no-recontext')
+        if not weaver.enable_entity_profiles:
+            flags.append('no-profiles')
         return 'memweaver' + (f" ({', '.join(flags)})" if flags else '')
 
     def run_test(self, num_samples: int = None, save_results: bool = True, result_file: str = 'locomo10_test_results.json', enable_parallel_questions: bool = False):
@@ -1173,6 +1177,10 @@ def main():
                        help='Ablation: threads and summaries only, no weave operations')
     parser.add_argument('--no-sweep', dest='sweep', action='store_false', default=None,
                        help='Ablation: skip the finalize cross-thread supersede sweep')
+    parser.add_argument('--no-recontext', dest='recontext', action='store_false', default=None,
+                       help='Ablation: embed facts as bare sentences (no thread-context prefix)')
+    parser.add_argument('--no-profiles', dest='profiles', action='store_false', default=None,
+                       help='Ablation: do not write entity profiles into the pool')
 
     args = parser.parse_args()
 
@@ -1182,15 +1190,21 @@ def main():
         clear_db=True,
         enable_memweaver=args.memweaver,
         enable_weaving=args.weaving,
-        enable_sweep=args.sweep
+        enable_sweep=args.sweep,
+        enable_recontext=args.recontext,
+        enable_entity_profiles=args.profiles
     )
 
     # The ablations only mean something on the MemWeaver arm; say so loudly
     # rather than producing a baseline run that looks like an ablation.
-    if (args.weaving is False or args.sweep is False) and not system.enable_memweaver:
+    if (
+        False in (args.weaving, args.sweep, args.recontext, args.profiles)
+        and not system.enable_memweaver
+    ):
         print(
-            "WARNING: --no-weaving / --no-sweep are MemWeaver ablations but "
-            "MemWeaver is disabled; this run is the plain baseline."
+            "WARNING: --no-weaving / --no-sweep / --no-recontext / --no-profiles "
+            "are MemWeaver ablations but MemWeaver is disabled; this run is the "
+            "plain baseline."
         )
 
     # Create tester

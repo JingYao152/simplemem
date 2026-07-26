@@ -28,14 +28,21 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from simplemem.core.database.vector_store import VectorStore
 from simplemem.core.memory_builder import MemoryBuilder
+from simplemem.core.memweaver.context import (
+    context_digest,
+    context_prefix,
+    contextual_embed_text,
+)
 from simplemem.core.memweaver.dates import parse_session_datetime, to_day
 from simplemem.core.memweaver.fabric import (
     FabricSnapshot,
     ThreadState,
+    build_entity_profile_entry,
     build_thread_summary_entry,
     execute_link,
     execute_supersede,
     load_fabric,
+    speaker_threads,
 )
 from simplemem.core.memweaver.prompts import (
     ASSIGNMENT_SYSTEM_PROMPT,
@@ -113,6 +120,8 @@ class MemWeaver:
         max_parallel_workers: Optional[int] = None,
         temperature: Optional[float] = None,
         fallback_extractor: Optional[MemoryBuilder] = None,
+        enable_recontext: Optional[bool] = None,
+        enable_entity_profiles: Optional[bool] = None,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
@@ -125,6 +134,19 @@ class MemWeaver:
             enable_sweep
             if enable_sweep is not None
             else getattr(config, "ENABLE_SWEEP", True)
+        )
+        # P1: context-inheriting embeddings + semantically triggered re-embedding.
+        # Off = facts are embedded as bare sentences, i.e. pure SimpleMem.
+        self.enable_recontext = (
+            enable_recontext
+            if enable_recontext is not None
+            else getattr(config, "ENABLE_RECONTEXT", True)
+        )
+        # P1: person-level living profiles in the retrieval pool.
+        self.enable_entity_profiles = (
+            enable_entity_profiles
+            if enable_entity_profiles is not None
+            else getattr(config, "ENABLE_ENTITY_PROFILES", True)
         )
         self.max_parallel_workers = (
             max_parallel_workers
@@ -167,6 +189,9 @@ class MemWeaver:
             "summary_rewrites": 0,
             "summary_skipped": 0,
             "outdated_signals": 0,
+            "recontext_reembedded": 0,
+            "recontext_up_to_date": 0,
+            "profiles_written": 0,
             "sweep_pairs_judged": 0,
             "sweep_supersedes": 0,
             "sweep_unordered_pairs": 0,
@@ -637,9 +662,29 @@ class MemWeaver:
         session_date: str,
         session_datetime: str,
     ) -> None:
-        new_facts = [fact for update in updates for fact in update.facts]
+        # The thread context a fact inherits is the summary as it stands *after*
+        # this session, so prefix and stored summary always agree (P1).
+        prefixes = {
+            assignment.thread_id: self._thread_prefix(assignment, update, snapshot)
+            for assignment, update in zip(assignments, updates)
+        }
+
+        new_facts: List[MemoryEntry] = []
+        embed_texts: List[str] = []
+        for assignment, update in zip(assignments, updates):
+            prefix = prefixes[assignment.thread_id]
+            digest = context_digest(prefix)
+            for fact in update.facts:
+                fact.context_digest = digest
+                new_facts.append(fact)
+                embed_texts.append(
+                    contextual_embed_text(prefix, fact.lossless_restatement)
+                )
+
         if new_facts:
-            self.vector_store.add_entries(new_facts)
+            # The prefix reaches the embedder only; every stored field keeps the
+            # fact's own text.
+            self.vector_store.add_entries(new_facts, embed_texts=embed_texts)
             self._bump("facts_written", len(new_facts))
 
         summary_entries: List[MemoryEntry] = []
@@ -662,6 +707,18 @@ class MemWeaver:
             self.vector_store.delete_by_ids(stale_summary_ids)
         if summary_entries:
             self.vector_store.add_entries(summary_entries)
+
+        # P1: the facts Call B named as outdated are re-embedded under the
+        # rewritten context (local compute, zero API cost).
+        for assignment, update in zip(assignments, updates):
+            self._recontextualize(
+                assignment, update, snapshot, prefixes[assignment.thread_id]
+            )
+
+        # P1: refresh the living profile of every speaker this session involved.
+        self._update_profiles(
+            assignments, updates, snapshot, session_date, session_datetime
+        )
 
     def _apply_weaves(
         self,
@@ -698,6 +755,47 @@ class MemWeaver:
                 else:
                     self._bump("weave_none")
 
+    def _resolve_summary(
+        self,
+        assignment: ThreadAssignment,
+        update: ThreadUpdate,
+        snapshot: FabricSnapshot,
+    ) -> Tuple[str, str, str, bool]:
+        """The thread's summary after this session.
+
+        Returns ``(summary_text, title, existing_summary_id, rewrite)``. Single
+        source of truth for both the stored summary row and the P1 context
+        prefix, so a fact's ``context_digest`` always matches the summary that
+        is actually stored.
+        """
+        state = snapshot.threads.get(assignment.thread_id)
+        existing_id = state.summary_entry_id if state else ""
+        title = (state.title if state and state.title else assignment.title) or ""
+        current = state.summary if state else ""
+
+        if existing_id and (update.summary_impact == "none" or not update.summary):
+            # Deterministic fallback for the summary decision: do not rewrite.
+            return current, title, existing_id, False
+
+        text = update.summary or (
+            update.facts[0].lossless_restatement if update.facts else title
+        )
+        if not text:
+            return current, title, existing_id, False
+        return text, title, existing_id, True
+
+    def _thread_prefix(
+        self,
+        assignment: ThreadAssignment,
+        update: ThreadUpdate,
+        snapshot: FabricSnapshot,
+    ) -> str:
+        """One-line thread context used as this thread's embedding prefix (P1)."""
+        if not self.enable_recontext:
+            return ""
+        summary, title, _, _ = self._resolve_summary(assignment, update, snapshot)
+        return context_prefix(summary, title)
+
     def _plan_summary_write(
         self,
         assignment: ThreadAssignment,
@@ -707,22 +805,10 @@ class MemWeaver:
         session_datetime: str,
     ) -> Tuple[Optional[MemoryEntry], str]:
         """Decide whether the living summary is rewritten this session."""
-        state = snapshot.threads.get(assignment.thread_id)
-        existing_id = state.summary_entry_id if state else ""
-        title = (state.title if state and state.title else assignment.title) or ""
-
-        has_new_text = bool(update.summary)
-        if existing_id and (update.summary_impact == "none" or not has_new_text):
-            # Deterministic fallback for the summary decision: do not rewrite.
-            self._bump("summary_skipped")
-            return None, ""
-
-        summary_text = update.summary
-        if not summary_text:
-            summary_text = (
-                update.facts[0].lossless_restatement if update.facts else title
-            )
-        if not summary_text:
+        summary_text, title, existing_id, rewrite = self._resolve_summary(
+            assignment, update, snapshot
+        )
+        if not rewrite:
             self._bump("summary_skipped")
             return None, ""
 
@@ -736,6 +822,113 @@ class MemWeaver:
             persons=[person for fact in update.facts for person in fact.persons],
         )
         return entry, existing_id
+
+    # ------------------------------------------------------------------
+    # P1 - representation co-evolution
+    # ------------------------------------------------------------------
+
+    def _recontextualize(
+        self,
+        assignment: ThreadAssignment,
+        update: ThreadUpdate,
+        snapshot: FabricSnapshot,
+        prefix: str,
+    ) -> None:
+        """Re-embed the facts Call B named as outdated under the new context.
+
+        The semantic trigger is Call B's ``outdated_facts``; the digest makes the
+        operation idempotent, so a fact already embedded under this context is
+        left alone. Fact text is never touched.
+        """
+        if not self.enable_recontext or not update.outdated_facts:
+            return
+
+        candidates = snapshot.facts(assignment.thread_id)
+        digest = context_digest(prefix)
+        targets: List[MemoryEntry] = []
+        texts: List[str] = []
+
+        for index in update.outdated_facts:
+            fact = candidates[index - 1]
+            if fact.context_digest == digest:
+                self._bump("recontext_up_to_date")
+                continue
+            targets.append(fact)
+            texts.append(contextual_embed_text(prefix, fact.lossless_restatement))
+
+        if not targets:
+            return
+
+        self.vector_store.reembed_entries(targets, texts, digest)
+        self._bump("recontext_reembedded", len(targets))
+        print(
+            f"[MemWeaver] re-contextualized {len(targets)} fact(s) of "
+            f"{assignment.thread_id} under the rewritten summary"
+        )
+
+    def _update_profiles(
+        self,
+        assignments: List[ThreadAssignment],
+        updates: List[ThreadUpdate],
+        snapshot: FabricSnapshot,
+        session_date: str,
+        session_datetime: str,
+    ) -> None:
+        """Rebuild the living profile of each speaker this session involved."""
+        if not self.enable_entity_profiles:
+            return
+
+        spoke_in: Dict[str, set] = {}
+        for assignment in assignments:
+            for turn in assignment.turns:
+                if turn.speaker:
+                    spoke_in.setdefault(turn.speaker, set()).add(assignment.thread_id)
+        if not spoke_in:
+            return
+
+        # Fabric view after this session: summaries as resolved above, plus the
+        # facts just written. No extra table scan.
+        threads_after = dict(snapshot.threads)
+        facts_after = {
+            thread_id: list(facts)
+            for thread_id, facts in snapshot.facts_by_thread.items()
+        }
+        for assignment, update in zip(assignments, updates):
+            summary, title, _, rewrite = self._resolve_summary(
+                assignment, update, snapshot
+            )
+            previous = snapshot.threads.get(assignment.thread_id)
+            threads_after[assignment.thread_id] = ThreadState(
+                thread_id=assignment.thread_id,
+                title=title,
+                summary=summary,
+                updated_on=session_date if rewrite
+                else (previous.updated_on if previous else session_date),
+            )
+            facts_after.setdefault(assignment.thread_id, []).extend(update.facts)
+
+        stale_ids: List[str] = []
+        profile_entries: List[MemoryEntry] = []
+        for name in sorted(spoke_in):
+            threads = speaker_threads(
+                threads_after, facts_after, name, spoke_in[name]
+            )
+            if not threads:
+                continue
+            existing = snapshot.profiles.get(name)
+            if existing is not None:
+                stale_ids.append(existing.entry_id)
+            profile_entries.append(
+                build_entity_profile_entry(
+                    name, threads, session_date, session_datetime
+                )
+            )
+
+        if stale_ids:
+            self.vector_store.delete_by_ids(stale_ids)
+        if profile_entries:
+            self.vector_store.add_entries(profile_entries)
+            self._bump("profiles_written", len(profile_entries))
 
     # ------------------------------------------------------------------
     # finalize() - cross-thread supersede sweep

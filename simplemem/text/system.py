@@ -47,7 +47,9 @@ class SimpleMemSystem:
         max_retrieval_workers: Optional[int] = None,
         enable_memweaver: Optional[bool] = None,
         enable_weaving: Optional[bool] = None,
-        enable_sweep: Optional[bool] = None
+        enable_sweep: Optional[bool] = None,
+        enable_recontext: Optional[bool] = None,
+        enable_entity_profiles: Optional[bool] = None
     ):
         """
         Initialize system
@@ -71,6 +73,8 @@ class SimpleMemSystem:
         - enable_memweaver: Use the MemWeaver fabric write pipeline + as-of retrieval (None=use config default)
         - enable_weaving: Enable typed weave operations (ablation switch, None=use config default)
         - enable_sweep: Enable the finalize cross-thread sweep (ablation switch, None=use config default)
+        - enable_recontext: Enable context-inheriting embeddings + re-embedding (ablation switch, None=use config default)
+        - enable_entity_profiles: Enable entity profiles in the pool (ablation switch, None=use config default)
         """
         print("=" * 60)
         print("Initializing SimpleMem System")
@@ -116,12 +120,16 @@ class SimpleMemSystem:
                 enable_weaving=enable_weaving,
                 enable_sweep=enable_sweep,
                 max_parallel_workers=max_parallel_workers,
-                fallback_extractor=self.memory_builder
+                fallback_extractor=self.memory_builder,
+                enable_recontext=enable_recontext,
+                enable_entity_profiles=enable_entity_profiles
             )
             print(
                 "\nMemWeaver write pipeline enabled "
                 f"(weaving={self.memweaver.enable_weaving}, "
                 f"sweep={self.memweaver.enable_sweep}, "
+                f"recontext={self.memweaver.enable_recontext}, "
+                f"profiles={self.memweaver.enable_entity_profiles}, "
                 f"temperature={self.memweaver.temperature})"
             )
 
@@ -258,7 +266,9 @@ def create_system(
     max_retrieval_workers: Optional[int] = None,
     enable_memweaver: Optional[bool] = None,
     enable_weaving: Optional[bool] = None,
-    enable_sweep: Optional[bool] = None
+    enable_sweep: Optional[bool] = None,
+    enable_recontext: Optional[bool] = None,
+    enable_entity_profiles: Optional[bool] = None
 ) -> SimpleMemSystem:
     """
     Create SimpleMem system instance (uses config.py defaults when None)
@@ -274,7 +284,9 @@ def create_system(
         max_retrieval_workers=max_retrieval_workers,
         enable_memweaver=enable_memweaver,
         enable_weaving=enable_weaving,
-        enable_sweep=enable_sweep
+        enable_sweep=enable_sweep,
+        enable_recontext=enable_recontext,
+        enable_entity_profiles=enable_entity_profiles
     )
 
 

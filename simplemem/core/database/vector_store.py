@@ -80,13 +80,30 @@ class VectorStore:
         """Expose the default backend's table handle for compatibility."""
         return getattr(self.backend, "table", None)
 
-    def add_entries(self, entries: List[MemoryEntry]) -> None:
-        """Embed and insert a batch of memory entries."""
+    def add_entries(
+        self,
+        entries: List[MemoryEntry],
+        embed_texts: Optional[List[str]] = None,
+    ) -> None:
+        """Embed and insert a batch of memory entries.
+
+        ``embed_texts`` overrides what is handed to the embedder, position by
+        position, while the stored text stays the entry's own restatement. This
+        is how MemWeaver's context-inheriting embeddings keep the thread-context
+        prefix out of every stored field (design doc section 4).
+        """
         if not entries:
             return
 
         restatements = [entry.lossless_restatement for entry in entries]
-        vectors = self.embedding_model.encode_documents(restatements)
+        if embed_texts is None:
+            embed_texts = restatements
+        elif len(embed_texts) != len(entries):
+            raise ValueError(
+                f"embed_texts has {len(embed_texts)} items for {len(entries)} entries"
+            )
+
+        vectors = self.embedding_model.encode_documents(embed_texts)
         records = [
             VectorStoreRecord(
                 entry_id=entry.entry_id,
@@ -219,6 +236,34 @@ class VectorStore:
 
         self.backend.update_metadata(entry_id, fields)
         self._revision += 1
+
+    def reembed_entries(
+        self,
+        entries: List[MemoryEntry],
+        embed_texts: List[str],
+        context_digest: str = "",
+    ) -> int:
+        """Recompute stored vectors from new embedding texts, in place.
+
+        Used by MemWeaver's re-contextualization: a rewritten thread summary
+        changes the context a fact should be embedded under, but not the fact
+        itself. Embedding is local, so this costs no API calls.
+        """
+        if not entries:
+            return 0
+        if len(embed_texts) != len(entries):
+            raise ValueError(
+                f"embed_texts has {len(embed_texts)} items for {len(entries)} entries"
+            )
+
+        vectors = self.embedding_model.encode_documents(embed_texts)
+        fields = {"context_digest": context_digest}
+        for entry, vector in zip(entries, vectors):
+            self.backend.update_vector(entry.entry_id, vector.tolist(), fields)
+            entry.context_digest = context_digest
+
+        self._revision += 1
+        return len(entries)
 
     def delete_by_ids(self, entry_ids: List[str]) -> None:
         """Delete entries by id (summary/profile rewrite = delete + insert)."""

@@ -124,6 +124,15 @@ class VectorStoreBackend(Protocol):
         """Update metadata fields of one stored record in place."""
         ...
 
+    def update_vector(
+        self,
+        entry_id: str,
+        vector: Sequence[float],
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Replace one record's dense vector (and optionally metadata) in place."""
+        ...
+
     def delete_by_ids(self, entry_ids: Sequence[str]) -> None:
         """Delete the records with the given ids."""
         ...
@@ -388,6 +397,28 @@ class LanceDBVectorStoreBackend:
                 values=dict(fields),
             )
             self._fts_dirty = True
+
+    def update_vector(
+        self,
+        entry_id: str,
+        vector: Sequence[float],
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        values: Dict[str, Any] = {"vector": list(vector)}
+        for field, value in (fields or {}).items():
+            if not self._field_pattern.fullmatch(field):
+                raise ValueError(f"Invalid metadata field: {field!r}")
+            if field in ("entry_id", "vector"):
+                raise ValueError(f"{field} cannot be updated through fields")
+            values[field] = value
+
+        with self._write_lock:
+            self.table.update(
+                where=f"entry_id = {self._quote(entry_id)}",
+                values=values,
+            )
+            # The fact's text is unchanged by a re-embed, so the full-text index
+            # stays valid; only the dense vector moved.
 
     def delete_by_ids(self, entry_ids: Sequence[str]) -> None:
         if not entry_ids:

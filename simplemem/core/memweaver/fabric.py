@@ -12,6 +12,7 @@ from typing import Dict, Iterable, List, Optional
 
 from simplemem.core.database.vector_store import VectorStore
 from simplemem.core.models.memory_entry import (
+    KIND_ENTITY_PROFILE,
     KIND_FACT,
     KIND_THREAD_SUMMARY,
     WEAVE_BRIDGE,
@@ -31,6 +32,7 @@ class ThreadState:
     title: str
     summary: str
     summary_entry_id: str = ""
+    updated_on: str = ""
 
     def one_line(self) -> str:
         """One-line rendering used in the Call A thread catalogue."""
@@ -48,6 +50,7 @@ class FabricSnapshot:
     threads: Dict[str, ThreadState] = field(default_factory=dict)
     facts_by_thread: Dict[str, List[MemoryEntry]] = field(default_factory=dict)
     entries: List[MemoryEntry] = field(default_factory=list)
+    profiles: Dict[str, MemoryEntry] = field(default_factory=dict)
 
     def facts(self, thread_id: str) -> List[MemoryEntry]:
         return self.facts_by_thread.get(thread_id, [])
@@ -69,6 +72,7 @@ def load_fabric(vector_store: VectorStore) -> FabricSnapshot:
 
     threads: Dict[str, ThreadState] = {}
     facts_by_thread: Dict[str, List[MemoryEntry]] = {}
+    profiles: Dict[str, MemoryEntry] = {}
 
     for entry in entries:
         if entry.kind == KIND_THREAD_SUMMARY and entry.thread_id:
@@ -77,7 +81,12 @@ def load_fabric(vector_store: VectorStore) -> FabricSnapshot:
                 title=entry.topic or "",
                 summary=entry.lossless_restatement or "",
                 summary_entry_id=entry.entry_id,
+                updated_on=entry.valid_from or "",
             )
+        elif entry.kind == KIND_ENTITY_PROFILE:
+            name = entry.persons[0] if entry.persons else entry.topic or ""
+            if name:
+                profiles[name] = entry
         elif entry.kind == KIND_FACT and entry.thread_id:
             facts_by_thread.setdefault(entry.thread_id, []).append(entry)
 
@@ -93,7 +102,10 @@ def load_fabric(vector_store: VectorStore) -> FabricSnapshot:
         )
 
     return FabricSnapshot(
-        threads=threads, facts_by_thread=facts_by_thread, entries=entries
+        threads=threads,
+        facts_by_thread=facts_by_thread,
+        entries=entries,
+        profiles=profiles,
     )
 
 
@@ -123,6 +135,68 @@ def build_thread_summary_entry(
         links=[],
         context_digest="",
     )
+
+
+def build_entity_profile_entry(
+    name: str,
+    threads: List[ThreadState],
+    session_date: str,
+    session_datetime: str,
+) -> MemoryEntry:
+    """Build a person's living profile from the threads they take part in.
+
+    Deterministic code, not an LLM call (design doc section 3 lists the profile
+    update inside the deterministic weaving-execution block), so profiles cost
+    nothing beyond Call A/B. The text is a person-level digest of the fabric: one
+    line per thread, most recently touched first. It evolves for free as the
+    thread summaries evolve.
+
+    There is no capacity parameter here: LoCoMo has exactly two speakers per
+    conversation, and a profile spans every thread that speaker appears in.
+    """
+    lines = [thread.one_line() for thread in threads]
+    body = " | ".join(line for line in lines if line)
+    text = f"{name} - ongoing threads across the conversation: {body}" if body else name
+
+    return MemoryEntry(
+        entry_id=MemoryEntry.entity_profile_id(name),
+        lossless_restatement=text,
+        keywords=[],
+        timestamp=session_datetime or None,
+        location=None,
+        persons=[name],
+        entities=[],
+        topic=name,
+        kind=KIND_ENTITY_PROFILE,
+        thread_id="",
+        valid_from=session_date,
+        valid_until="",
+        superseded_by="",
+        links=[],
+        context_digest="",
+    )
+
+
+def speaker_threads(
+    threads: Dict[str, ThreadState],
+    facts_by_thread: Dict[str, List[MemoryEntry]],
+    name: str,
+    extra_thread_ids: Optional[Iterable[str]] = None,
+) -> List[ThreadState]:
+    """Threads a person participates in, most recently updated first.
+
+    Participation is read off stored data: the person appears in a fact's
+    ``persons``. ``extra_thread_ids`` adds threads the person just spoke in, for
+    the session being written (its facts may not name them yet).
+    """
+    participating = set(extra_thread_ids or ())
+    for thread_id, facts in facts_by_thread.items():
+        if any(name in fact.persons for fact in facts):
+            participating.add(thread_id)
+
+    states = [threads[tid] for tid in participating if tid in threads]
+    states.sort(key=lambda state: (state.updated_on, state.thread_id), reverse=True)
+    return states
 
 
 def execute_supersede(

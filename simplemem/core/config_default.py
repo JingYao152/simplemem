@@ -129,7 +129,14 @@ ENABLE_WEAVING = True
 ENABLE_SWEEP = True
 
 # P1: context-inheriting embeddings + semantically triggered re-embedding.
-ENABLE_RECONTEXT = False
+# Facts are embedded as "[<one-line thread summary>] <fact>"; the prefix reaches
+# the embedder only, never any stored text. False = pure SimpleMem single-sentence
+# embeddings, which is the P1 ablation.
+ENABLE_RECONTEXT = True
+
+# P1: person-level living profiles (profile::<speaker>) in the retrieval pool,
+# built by deterministic code from the threads a speaker takes part in.
+ENABLE_ENTITY_PROFILES = True
 
 # P2: one-hop evidence expansion + cross-encoder rerank.
 ENABLE_EXPAND_RERANK = False

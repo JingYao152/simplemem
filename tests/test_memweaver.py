@@ -24,9 +24,16 @@ from simplemem.core.memweaver.asof import (
     compute_anchor,
     is_temporal_history_question,
 )
+from simplemem.core.memweaver.context import (
+    CONTEXT_PREFIX_MAX_CHARS,
+    context_digest,
+    context_prefix,
+    contextual_embed_text,
+)
 from simplemem.core.memweaver.dates import parse_session_datetime, to_day
-from simplemem.core.memweaver.fabric import load_fabric
+from simplemem.core.memweaver.fabric import ThreadState, load_fabric, speaker_threads
 from simplemem.core.models.memory_entry import (
+    KIND_ENTITY_PROFILE,
     KIND_FACT,
     KIND_THREAD_SUMMARY,
     Dialogue,
@@ -67,6 +74,27 @@ class KeywordEmbedder:
                 vector[axis] = 1.0
         if not vector.any():
             vector[3] = 1.0
+        return vector
+
+
+class RecordingEmbedder(KeywordEmbedder):
+    """Records what text actually reached the embedder, and marks prefixes."""
+
+    def __init__(self):
+        self.documents = []
+
+    def encode_documents(self, texts):
+        self.documents.extend(texts)
+        return np.stack([self._encode(text) for text in texts])
+
+    @classmethod
+    def _encode(cls, text):
+        vector = super()._encode(text)
+        # A prefixed text lands on its own axis, so a re-embed is observable
+        # through search as well as through the recorded texts.
+        if text.startswith("["):
+            vector = vector.copy()
+            vector[3] = 0.5
         return vector
 
 
@@ -181,6 +209,15 @@ def store(tmp_path):
         db_path=str(tmp_path / "lancedb"),
         table_name="entries",
         embedding_model=KeywordEmbedder(),
+    )
+
+
+@pytest.fixture
+def recording_store(tmp_path):
+    return VectorStore(
+        db_path=str(tmp_path / "lancedb-recording"),
+        table_name="entries",
+        embedding_model=RecordingEmbedder(),
     )
 
 
@@ -1181,3 +1218,419 @@ def test_thread_summaries_are_part_of_the_semantic_pool(store):
 
     kinds = {entry.kind for entry in results}
     assert KIND_THREAD_SUMMARY in kinds and KIND_FACT in kinds
+
+
+# ----------------------------------------------------------------------
+# P1 - context-inheriting embeddings (design doc section 4)
+# ----------------------------------------------------------------------
+
+
+def test_context_prefix_is_the_first_sentence_of_the_living_summary():
+    assert context_prefix(
+        "Melanie paints watercolours every weekend. She started in 2021."
+    ) == "Melanie paints watercolours every weekend."
+    # Falls back to the title, then to nothing at all.
+    assert context_prefix("", "Painting hobby") == "Painting hobby"
+    assert context_prefix("", "") == ""
+    assert context_prefix(None) == ""
+
+    long_summary = "word " * 200
+    prefix = context_prefix(long_summary)
+    assert len(prefix) <= CONTEXT_PREFIX_MAX_CHARS + 3
+    assert prefix.endswith("...")
+
+
+def test_contextual_embed_text_and_digest_are_consistent():
+    assert contextual_embed_text("Painting hobby", "Melanie bought brushes.") == (
+        "[Painting hobby] Melanie bought brushes."
+    )
+    assert contextual_embed_text("", "Melanie bought brushes.") == (
+        "Melanie bought brushes."
+    )
+    assert context_digest("Painting hobby") == context_digest("Painting hobby")
+    assert context_digest("Painting hobby") != context_digest("Pottery class")
+    assert context_digest("") == ""
+
+
+def test_thread_context_reaches_the_embedder_but_no_stored_field(recording_store):
+    llm = ScriptedLLM(
+        assignment=[assignment(([1], "new:Painting hobby"))],
+        thread_update=[
+            thread_update(
+                [fact("Melanie bought watercolor brushes.")],
+                summary="Melanie has painted watercolours for years.",
+            )
+        ],
+    )
+    weaver = build_weaver(recording_store, llm)
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "paint talk"))
+    weaver.process_remaining()
+
+    embedded = [text for text in recording_store.embedding_model.documents
+                if "watercolor brushes" in text]
+    assert embedded == [
+        "[Melanie has painted watercolours for years.] "
+        "Melanie bought watercolor brushes."
+    ]
+
+    stored = by_text(recording_store, "watercolor brushes")
+    # The text layer stays pure SimpleMem: no prefix in any stored field.
+    assert stored.lossless_restatement == "Melanie bought watercolor brushes."
+    assert "[" not in stored.lossless_restatement
+    assert stored.topic == "topic" and stored.keywords == []
+    # The vector layer records which context it was built under.
+    assert stored.context_digest == context_digest(
+        "Melanie has painted watercolours for years."
+    )
+
+
+def test_recontext_disabled_embeds_the_bare_sentence(recording_store):
+    llm = ScriptedLLM(
+        assignment=[assignment(([1], "new:Painting hobby"))],
+        thread_update=[
+            thread_update(
+                [fact("Melanie bought watercolor brushes.")],
+                summary="Melanie has painted watercolours for years.",
+            )
+        ],
+    )
+    weaver = build_weaver(recording_store, llm, enable_recontext=False)
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "paint talk"))
+    weaver.process_remaining()
+
+    assert "Melanie bought watercolor brushes." in (
+        recording_store.embedding_model.documents
+    )
+    assert not any(
+        text.startswith("[") for text in recording_store.embedding_model.documents
+    )
+    assert by_text(recording_store, "watercolor brushes").context_digest == ""
+
+
+def test_facts_inherit_the_kept_summary_when_it_is_not_rewritten(recording_store):
+    llm = ScriptedLLM(
+        assignment=[
+            assignment(([1], "new:Painting hobby")),
+            assignment(([1], "existing:t1")),
+        ],
+        thread_update=[
+            thread_update([fact("Melanie paints on weekends.")], summary="First summary."),
+            thread_update(
+                [fact("Melanie mentioned paint prices.")],
+                summary="Ignored rewrite.",
+                impact="none",
+            ),
+        ],
+    )
+    weaver = build_weaver(recording_store, llm)
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "paint"))
+    weaver.add_dialogues(turns("1:00 pm on 8 June, 2023", "prices", start=2))
+    weaver.process_remaining()
+
+    # The stored summary was kept, so the context prefix is the kept one - the
+    # digest can never disagree with what is stored.
+    summary = recording_store.get_by_ids([MemoryEntry.thread_summary_id("t1")])[0]
+    assert summary.lossless_restatement == "First summary."
+    later = by_text(recording_store, "paint prices")
+    assert later.context_digest == context_digest("First summary.")
+    assert "[First summary.] Melanie mentioned paint prices." in (
+        recording_store.embedding_model.documents
+    )
+
+
+# ----------------------------------------------------------------------
+# P1 - semantically triggered re-embedding
+# ----------------------------------------------------------------------
+
+
+def _recontext_llm():
+    return ScriptedLLM(
+        assignment=[
+            assignment(([1], "new:Painting hobby")),
+            assignment(([1], "existing:t1")),
+            assignment(([1], "existing:t1")),
+        ],
+        thread_update=[
+            thread_update([fact("Melanie bought watercolor brushes.")],
+                          summary="Melanie is starting to paint."),
+            thread_update([fact("Melanie sold a painting.")],
+                          summary="Melanie now sells her watercolour paintings.",
+                          outdated=[1]),
+            thread_update([fact("Melanie framed a painting.")],
+                          summary="Melanie now sells her watercolour paintings.",
+                          impact="minor",
+                          outdated=[1]),
+        ],
+    )
+
+
+def test_outdated_facts_are_reembedded_under_the_rewritten_summary(recording_store):
+    weaver = build_weaver(recording_store, _recontext_llm())
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "brushes"))
+    weaver.process_remaining()
+    first_digest = by_text(recording_store, "watercolor brushes").context_digest
+
+    weaver.add_dialogues(turns("1:00 pm on 8 June, 2023", "sold", start=2))
+    weaver.process_remaining()
+
+    old_fact = by_text(recording_store, "watercolor brushes")
+    assert weaver.stats["recontext_reembedded"] == 1
+    assert old_fact.context_digest != first_digest
+    assert old_fact.context_digest == context_digest(
+        "Melanie now sells her watercolour paintings."
+    )
+    # Fact text is immutable - only the vector moved.
+    assert old_fact.lossless_restatement == "Melanie bought watercolor brushes."
+    assert (
+        "[Melanie now sells her watercolour paintings.] "
+        "Melanie bought watercolor brushes."
+    ) in recording_store.embedding_model.documents
+
+
+def test_reembedding_is_idempotent_via_the_context_digest(recording_store):
+    weaver = build_weaver(recording_store, _recontext_llm())
+
+    for stamp, text, start in (
+        ("1:00 pm on 1 May, 2023", "brushes", 1),
+        ("1:00 pm on 8 June, 2023", "sold", 2),
+        ("1:00 pm on 9 July, 2023", "framed", 3),
+    ):
+        weaver.add_dialogues(turns(stamp, text, start=start))
+        weaver.process_remaining()
+
+    # Third session names the same fact again, but the summary is unchanged, so
+    # its vector is already current.
+    assert weaver.stats["recontext_reembedded"] == 1
+    assert weaver.stats["recontext_up_to_date"] == 1
+
+
+def test_recontext_disabled_never_reembeds(recording_store):
+    weaver = build_weaver(recording_store, _recontext_llm(), enable_recontext=False)
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "brushes"))
+    weaver.process_remaining()
+    weaver.add_dialogues(turns("1:00 pm on 8 June, 2023", "sold", start=2))
+    weaver.process_remaining()
+
+    assert weaver.stats["recontext_reembedded"] == 0
+    assert weaver.stats["outdated_signals"] == 1  # the signal is still recorded
+
+
+def test_reembed_entries_rejects_mismatched_texts(store):
+    store.add_entries([MemoryEntry(entry_id="f1", lossless_restatement="a")])
+    entries = store.get_by_ids(["f1"])
+
+    with pytest.raises(ValueError, match="embed_texts has"):
+        store.reembed_entries(entries, ["one", "two"], "digest")
+    with pytest.raises(ValueError, match="embed_texts has"):
+        store.add_entries(entries, embed_texts=[])
+
+
+def test_update_vector_moves_the_entry_in_the_index(store):
+    store.add_entries(
+        [
+            MemoryEntry(entry_id="f1", lossless_restatement="Alice drinks coffee"),
+            MemoryEntry(entry_id="f2", lossless_restatement="Melanie paints"),
+        ]
+    )
+    assert store.semantic_search("paint", top_k=1)[0].entry_id == "f2"
+
+    # Re-embed f1 under a painting context; it must now win the paint query.
+    store.reembed_entries(
+        store.get_by_ids(["f1"]), ["[Painting hobby] Alice drinks coffee"], "digest1"
+    )
+    reembedded = store.get_by_ids(["f1"])[0]
+    assert reembedded.context_digest == "digest1"
+    assert reembedded.lossless_restatement == "Alice drinks coffee"
+    assert "f1" in {
+        entry.entry_id for entry in store.semantic_search("paint", top_k=2)
+    }
+
+    with pytest.raises(ValueError, match="cannot be updated through fields"):
+        store.backend.update_vector("f1", [0.0] * 4, {"vector": [1.0]})
+    with pytest.raises(ValueError, match="Invalid metadata field"):
+        store.backend.update_vector("f1", [0.0] * 4, {"kind = 'x' OR TRUE": "y"})
+
+
+# ----------------------------------------------------------------------
+# P1 - entity profiles in the retrieval pool
+# ----------------------------------------------------------------------
+
+
+def _profile_llm():
+    return ScriptedLLM(
+        assignment=[
+            assignment(([1, 2], "new:Painting hobby")),
+            assignment(([1], "existing:t1"), ([2], "new:Pottery class")),
+        ],
+        thread_update=[
+            thread_update(
+                [fact("Melanie paints watercolours.", persons=["Melanie"])],
+                summary="Melanie paints watercolours every weekend.",
+            ),
+            thread_update(
+                [fact("Melanie sold a painting.", persons=["Melanie"])],
+                summary="Melanie sells her watercolour paintings now.",
+            ),
+            thread_update(
+                [fact("Caroline signed up for pottery.", persons=["Caroline"])],
+                summary="Caroline joined a pottery class.",
+            ),
+        ],
+    )
+
+
+def test_entity_profiles_are_written_for_the_session_speakers(store):
+    llm = _profile_llm()
+    weaver = build_weaver(store, llm)
+
+    weaver.add_dialogues(
+        [
+            Dialogue(dialogue_id=1, speaker="Melanie", content="I paint",
+                     timestamp="1:00 pm on 1 May, 2023"),
+            Dialogue(dialogue_id=2, speaker="Caroline", content="nice",
+                     timestamp="1:00 pm on 1 May, 2023"),
+        ]
+    )
+    weaver.process_remaining()
+
+    profiles = {
+        entry.entry_id: entry
+        for entry in store.get_all_entries()
+        if entry.kind == KIND_ENTITY_PROFILE
+    }
+    assert set(profiles) == {
+        MemoryEntry.entity_profile_id("Melanie"),
+        MemoryEntry.entity_profile_id("Caroline"),
+    }
+    melanie = profiles[MemoryEntry.entity_profile_id("Melanie")]
+    assert melanie.persons == ["Melanie"]
+    assert melanie.topic == "Melanie"
+    assert melanie.valid_from == "2023-05-01" and melanie.is_open
+    assert "Painting hobby" in melanie.lossless_restatement
+    assert "Melanie paints watercolours every weekend." in melanie.lossless_restatement
+    assert weaver.stats["profiles_written"] == 2
+
+
+def test_profiles_are_rewritten_in_place_as_threads_evolve(store):
+    llm = _profile_llm()
+    weaver = build_weaver(store, llm)
+
+    weaver.add_dialogues(
+        [
+            Dialogue(dialogue_id=1, speaker="Melanie", content="I paint",
+                     timestamp="1:00 pm on 1 May, 2023"),
+            Dialogue(dialogue_id=2, speaker="Caroline", content="nice",
+                     timestamp="1:00 pm on 1 May, 2023"),
+        ]
+    )
+    weaver.add_dialogues(
+        [
+            Dialogue(dialogue_id=3, speaker="Melanie", content="sold one",
+                     timestamp="2:00 pm on 8 June, 2023"),
+            Dialogue(dialogue_id=4, speaker="Caroline", content="pottery for me",
+                     timestamp="2:00 pm on 8 June, 2023"),
+        ]
+    )
+    weaver.process_remaining()
+
+    profiles = [
+        entry
+        for entry in store.get_all_entries()
+        if entry.kind == KIND_ENTITY_PROFILE
+    ]
+    assert len(profiles) == 2, "one row per speaker, rewritten not appended"
+
+    melanie = store.get_by_ids([MemoryEntry.entity_profile_id("Melanie")])[0]
+    caroline = store.get_by_ids([MemoryEntry.entity_profile_id("Caroline")])[0]
+    assert "sells her watercolour paintings" in melanie.lossless_restatement
+    assert melanie.valid_from == "2023-06-08"
+    # Caroline's own thread shows up in her profile; Melanie's does not.
+    assert "Pottery class" in caroline.lossless_restatement
+    assert "Pottery class" not in melanie.lossless_restatement
+
+
+def test_profiles_join_the_semantic_pool(store):
+    llm = _profile_llm()
+    weaver = build_weaver(store, llm)
+
+    weaver.add_dialogues(
+        [
+            Dialogue(dialogue_id=1, speaker="Melanie", content="I paint",
+                     timestamp="1:00 pm on 1 May, 2023"),
+            Dialogue(dialogue_id=2, speaker="Caroline", content="nice",
+                     timestamp="1:00 pm on 1 May, 2023"),
+        ]
+    )
+    weaver.process_remaining()
+
+    retriever = _retriever(store, semantic_top_k=10)
+    kinds = {entry.kind for entry in retriever.retrieve("What does Melanie paint?")}
+
+    assert KIND_ENTITY_PROFILE in kinds
+    assert KIND_FACT in kinds
+
+
+def test_profiles_disabled_writes_no_profile_rows(store):
+    llm = _profile_llm()
+    weaver = build_weaver(store, llm, enable_entity_profiles=False)
+
+    weaver.add_dialogues(
+        [
+            Dialogue(dialogue_id=1, speaker="Melanie", content="I paint",
+                     timestamp="1:00 pm on 1 May, 2023"),
+            Dialogue(dialogue_id=2, speaker="Caroline", content="nice",
+                     timestamp="1:00 pm on 1 May, 2023"),
+        ]
+    )
+    weaver.process_remaining()
+
+    assert not [
+        entry
+        for entry in store.get_all_entries()
+        if entry.kind == KIND_ENTITY_PROFILE
+    ]
+    assert weaver.stats["profiles_written"] == 0
+
+
+def test_profiles_count_as_session_dated_for_the_anchor():
+    entries = [
+        MemoryEntry(
+            lossless_restatement="profile",
+            kind=KIND_ENTITY_PROFILE,
+            persons=["Melanie"],
+            valid_from="2023-08-01",
+        ),
+        MemoryEntry(
+            lossless_restatement="summary",
+            kind=KIND_THREAD_SUMMARY,
+            valid_from="2023-06-08",
+        ),
+        MemoryEntry(lossless_restatement="future plan", valid_from="2024-01-01"),
+    ]
+
+    assert compute_anchor(entries) == "2023-08-01"
+
+
+def test_speaker_threads_orders_by_recency():
+    threads = {
+        "t1": ThreadState("t1", "Painting", "s1", updated_on="2023-05-01"),
+        "t2": ThreadState("t2", "Pottery", "s2", updated_on="2023-07-01"),
+        "t3": ThreadState("t3", "Running", "s3", updated_on="2023-06-01"),
+    }
+    facts_by_thread = {
+        "t1": [MemoryEntry(lossless_restatement="a", persons=["Melanie"])],
+        "t2": [MemoryEntry(lossless_restatement="b", persons=["Caroline"])],
+        "t3": [MemoryEntry(lossless_restatement="c", persons=["Melanie"])],
+    }
+
+    ordered = speaker_threads(threads, facts_by_thread, "Melanie")
+    assert [state.thread_id for state in ordered] == ["t3", "t1"]
+
+    # A thread the speaker just spoke in counts even before its facts name them.
+    with_extra = speaker_threads(threads, facts_by_thread, "Melanie", ["t2"])
+    assert [state.thread_id for state in with_extra] == ["t2", "t3", "t1"]

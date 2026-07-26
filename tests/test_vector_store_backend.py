@@ -7,6 +7,7 @@ from simplemem.core.database import (
     LanceDBVectorStoreBackend,
     ScoreOrder,
     VectorStore,
+    VectorStoreRecord,
     VectorStoreSearchResult,
 )
 from simplemem.core.hybrid_retriever import HybridRetriever
@@ -178,6 +179,17 @@ class InMemoryVectorStoreBackend:
             if record.entry_id == entry_id:
                 record.metadata.update(fields)
 
+    def update_vector(self, entry_id, vector, fields=None):
+        for index, record in enumerate(self.records):
+            if record.entry_id == entry_id:
+                metadata = dict(record.metadata)
+                metadata.update(fields or {})
+                self.records[index] = VectorStoreRecord(
+                    entry_id=entry_id,
+                    vector=list(vector),
+                    metadata=metadata,
+                )
+
     def delete_by_ids(self, entry_ids):
         removed = set(entry_ids)
         self.records = [
@@ -212,6 +224,7 @@ class TrackingVectorStoreBackend:
             "get_all": 0,
             "get_by_ids": 0,
             "update_metadata": 0,
+            "update_vector": 0,
             "delete_by_ids": 0,
             "optimize": 0,
             "clear": 0,
@@ -249,6 +262,10 @@ class TrackingVectorStoreBackend:
     def update_metadata(self, entry_id, fields):
         self.calls["update_metadata"] += 1
         self.delegate.update_metadata(entry_id, fields)
+
+    def update_vector(self, entry_id, vector, fields=None):
+        self.calls["update_vector"] += 1
+        self.delegate.update_vector(entry_id, vector, fields)
 
     def delete_by_ids(self, entry_ids):
         self.calls["delete_by_ids"] += 1

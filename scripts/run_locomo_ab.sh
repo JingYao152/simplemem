@@ -61,6 +61,16 @@ if [[ "$ABLATIONS" == "1" ]]; then
     python test_locomo10.py "${COMMON[@]}" --memweaver --no-sweep \
         --result-file "$OUT/mw_no_sweep.json" 2>&1 \
         | tee "$OUT/mw_no_sweep.log" | tail -40
+
+    echo "== ablation: no recontext =="
+    python test_locomo10.py "${COMMON[@]}" --memweaver --no-recontext \
+        --result-file "$OUT/mw_no_recontext.json" 2>&1 \
+        | tee "$OUT/mw_no_recontext.log" | tail -40
+
+    echo "== ablation: no profiles =="
+    python test_locomo10.py "${COMMON[@]}" --memweaver --no-profiles \
+        --result-file "$OUT/mw_no_profiles.json" 2>&1 \
+        | tee "$OUT/mw_no_profiles.log" | tail -40
 fi
 
 echo "== comparison =="
@@ -69,7 +79,7 @@ python scripts/compare_locomo_results.py \
     | tee "$OUT/comparison.txt"
 
 if [[ "$ABLATIONS" == "1" ]]; then
-    for ablation in no_weaving no_sweep; do
+    for ablation in no_weaving no_sweep no_recontext no_profiles; do
         echo "== comparison: memweaver vs $ablation =="
         python scripts/compare_locomo_results.py \
             "$OUT"/memweaver_run*.json --memweaver "$OUT/mw_$ablation.json" \

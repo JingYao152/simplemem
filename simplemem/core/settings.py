@@ -42,7 +42,8 @@ _DEFAULTS = {
     "ENABLE_MEMWEAVER": False,
     "ENABLE_WEAVING": True,
     "ENABLE_SWEEP": True,
-    "ENABLE_RECONTEXT": False,
+    "ENABLE_RECONTEXT": True,
+    "ENABLE_ENTITY_PROFILES": True,
     "ENABLE_EXPAND_RERANK": False,
     "LLM_TEMPERATURE": 0.7,
 }

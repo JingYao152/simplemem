@@ -14,7 +14,15 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from simplemem.core.database.vector_store_backend import AnyOf, FieldPredicate
-from simplemem.core.models.memory_entry import KIND_THREAD_SUMMARY, MemoryEntry
+from simplemem.core.models.memory_entry import (
+    KIND_ENTITY_PROFILE,
+    KIND_THREAD_SUMMARY,
+    MemoryEntry,
+)
+
+
+#: Kinds the write pipeline stamps with the session date they were written in.
+_SESSION_DATED_KINDS = frozenset({KIND_THREAD_SUMMARY, KIND_ENTITY_PROFILE})
 
 
 # One deterministic structural rule, the only question-type judgement on the
@@ -37,16 +45,16 @@ def compute_anchor(entries: Iterable[MemoryEntry]) -> str:
     """Largest session date present in the memory, or ``""`` when unknown.
 
     Session dates are recovered from the entries the write pipeline stamps with
-    them: living thread summaries (rewritten at the session date) and closed
-    facts (``valid_until`` = the superseding session's date). Facts' own
-    ``valid_from`` can be a future date mentioned in dialogue, so it is only a
-    last-resort fallback.
+    them: living thread summaries and entity profiles (rewritten at the session
+    date) and closed facts (``valid_until`` = the superseding session's date).
+    Facts' own ``valid_from`` can be a future date mentioned in dialogue, so it
+    is only a last-resort fallback.
     """
     session_dates: List[str] = []
     fallback: List[str] = []
 
     for entry in entries:
-        if entry.kind == KIND_THREAD_SUMMARY and entry.valid_from:
+        if entry.kind in _SESSION_DATED_KINDS and entry.valid_from:
             session_dates.append(entry.valid_from)
         if entry.valid_until:
             session_dates.append(entry.valid_until)

@@ -1,7 +1,12 @@
-# MemWeaver P0 实现说明
+# MemWeaver 实现说明（P0 + P1）
 
-对应 `docs/memweaver-design.md` 第 8 节 P0 阶段：数据模型 + 后端三能力 +
-Call A/B 写管线 + supersede 执行 + as-of 检索 + finalize 兜底扫描。
+对应 `docs/memweaver-design.md` 第 8 节的前两个阶段：
+
+- **P0**：数据模型 + 后端三能力 + Call A/B 写管线 + supersede 执行 + as-of 检索
+  + finalize 兜底扫描（目标类别：cat2 时间题 321 题）
+- **P1**：上下文继承嵌入 + `outdated_facts` 重嵌入 + 实体档案入池
+  （目标类别：cat1 单跳 282 题、cat4 开放域 841 题）
+
 本文只记录"设计 → 代码"的落点、实现期做的判断，以及验证方式；设计本身以
 `memweaver-design.md` 为准。
 
@@ -19,23 +24,30 @@ Call A/B 写管线 + supersede 执行 + as-of 检索 + finalize 兜底扫描。
 | Call A / Call B / 兜底扫描 prompt | `simplemem/core/memweaver/prompts.py` |
 | 写管线（session 切分、Call A、Call B、编织执行、活体摘要、跨线程扫描） | `simplemem/core/memweaver/writer.py` |
 | 时间锚 + when 类问题规则 + as-of 谓词 | `simplemem/core/memweaver/asof.py` |
+| **P1** 上下文前缀 / 嵌入文本 / `context_digest` 指纹 | `simplemem/core/memweaver/context.py` |
+| **P1** 嵌入文本覆写（前缀只进向量）+ 原地重嵌入 | `vector_store.py` `add_entries(embed_texts=...)` / `reembed_entries`；后端 `update_vector` |
+| **P1** `outdated_facts` 触发的重上下文化 | `writer.py` `_recontextualize` |
+| **P1** 实体档案构建（确定性）与人物→线程归属 | `fabric.py` `build_entity_profile_entry` / `speaker_threads`；`writer.py` `_update_profiles` |
 | 检索侧 as-of 叠加 | `simplemem/core/hybrid_retriever.py` |
 | 消融开关 / `LLM_TEMPERATURE` | `simplemem/core/settings.py`、`simplemem/core/config_default.py` |
 | 系统装配（写路由 + finalize） | `main.py` |
 | 评测：A/B 同 harness + evidence 检索命中率 | `test_locomo10.py`、`locomo_evidence.py` |
 
-单元测试：`tests/test_memweaver.py`（45 例，全部 LLM 调用脚本化，覆盖每个
-决策点的确定性兜底）、`tests/test_evidence_retrieval.py`（12 例）。
+单元测试：`tests/test_memweaver.py`（63 例，全部 LLM 调用脚本化，覆盖每个
+决策点的确定性兜底、P1 的前缀不落库/指纹幂等/档案重写）、
+`tests/test_evidence_retrieval.py`（12 例）。
 
-## 2. 参数账本（与设计一致）
+## 2. 参数账本
 
-新增**调优参数 0 个**。代码中出现的常数都是结构常数或评测常数：
+新增**调优参数 0 个**（与设计的核心承诺一致）。代码中出现的常数都是结构常数、
+格式常数或评测常数，没有一个会改变任何组织决策：
 
 | 常数 | 值 | 性质 |
 |---|---|---|
 | `SWEEP_NEIGHBOURS` | 3 | 设计第 3 节"top-3 跨线程近邻"，结构常数 |
 | `SWEEP_SCAN_DEPTH` | 12 | 为拿到 3 个跨线程近邻而多取的行数，纯实现细节 |
 | `SWEEP_BATCH_SIZE` | 20 | 判定 prompt 的分批大小；所有候选对都会被判定，不改变任何决策 |
+| `CONTEXT_PREFIX_MAX_CHARS` | 200 | P1 上下文前缀的渲染长度上限，格式常数（同 `ThreadState.one_line()` 的 240） |
 | `EVIDENCE_HIT_THRESHOLD` | 0.3 | **评测侧**命中判定阈值，不属于系统参数 |
 
 扫描没有引入"相似度阈值"：候选对由"top-3 跨线程近邻"结构性给出，避免新增
@@ -71,7 +83,32 @@ Call A/B 写管线 + supersede 执行 + as-of 检索 + finalize 兜底扫描。
 7. **线程状态不缓存**：每个 session 处理前从存储重建织物快照（`load_fabric`）。
    代价是每 session 一次全表读，收益是 harness 每个样本 `vector_store.clear()`
    之后写侧自动归零，不会出现内存态与存储态漂移。
-8. **全文索引失效修复**（`vector_store_backend.py`）：LanceDB 的 FTS 索引不随写入
+8. **P1 前缀与摘要不可能不一致**：事实的上下文前缀与本 session 实际落库的
+   摘要来自同一个函数 `_resolve_summary`（返回"本 session 之后该线程的摘要 +
+   是否重写"）。若 `summary_impact == "none"`，前缀取**旧摘要**（因为落库的仍
+   是旧摘要），这样 `context_digest` 永远指向真实存在的那段摘要，重嵌入的幂等
+   判断才可靠。
+9. **重嵌入用原地改向量，而非删旧插新**：设计给 P0 的三能力里"摘要/档案更新 =
+   删旧行 + 插新行"，但重嵌入是高频操作（每次摘要重写都可能点名若干事实），
+   删插之间进程中断会丢事实。因此后端补了第 4 个能力 `update_vector`
+   （只换向量 + `context_digest`，事实文本不动，全文索引因此无需重建）。
+10. **重上下文化是选择性的，不是全量重建索引**：只有 Call B 在 `outdated_facts`
+   里点名的事实会被重嵌入。实测（6 session 样本）108 条事实里 42 条的指纹等于
+   当前活体摘要，其余仍挂在更早版本的摘要上——这是设计的语义触发语义，不是
+   缺陷。想要"全量重上下文化"是另一个机制，未实现。
+11. **实体档案由确定性代码生成，不额外调 LLM**：设计第 3 节把档案更新列在
+   "编织执行（确定性代码，非 LLM）"块内，成本模型（第 9 节）也只算 Call A/B。
+   实现为人物级织物摘要：该说话人参与的每个线程一行（标题 + 一句话摘要），
+   按线程最近更新时间排序，随摘要演化自动更新。参与关系读自存储数据
+   （事实的 `persons`），外加本 session 该说话人实际发言的线程。
+   档案不设容量参数（LoCoMo 每对话恰好 2 名说话人）。
+   **风险**：档案文本较长（数 KB），其向量是人物级混合，可能在 top-25 里挤掉
+   具体事实；用 `ENABLE_ENTITY_PROFILES` 单独消融即可量化。
+12. **消融开关比设计多一个**：设计第 8 节的 5 个开关把 P1 的三个机制压在
+   一行里。前缀嵌入与实体档案是两个独立机制、贡献可分离，故拆成
+   `ENABLE_RECONTEXT`（前缀 + 重嵌入）与 `ENABLE_ENTITY_PROFILES`（档案入池）
+   两个开关。两者都为 True 时等于设计描述的 P1 全量行为。
+13. **全文索引失效修复**（`vector_store_backend.py`）：LanceDB 的 FTS 索引不随写入
    增量更新，原实现只在首次 insert 时建索引。基线一次性批量写入时无感，但
    MemWeaver 每 session 写一次，会导致只有第 1 个 session 的事实进入词法路。
    改为"写入/更新/删除标脏 → 下次词法检索前重建"，两个 arm 共享此修复，
@@ -86,7 +123,8 @@ Call A/B 写管线 + supersede 执行 + as-of 检索 + finalize 兜底扫描。
 | `ENABLE_MEMWEAVER` | `False` | P0：总开关（写管线 + as-of）。`False` = 纯 SimpleMem 基线 |
 | `ENABLE_WEAVING` | `True` | P0：类型化编织（supersede/refine/bridge）。关掉只保留线程 + 活体摘要 |
 | `ENABLE_SWEEP` | `True` | P0：finalize 跨线程 supersede 扫描 |
-| `ENABLE_RECONTEXT` | `False` | **P1 占位**，当前无实现 |
+| `ENABLE_RECONTEXT` | `True` | P1：上下文继承嵌入 + `outdated_facts` 重嵌入。关掉 = 纯 SimpleMem 单句嵌入 |
+| `ENABLE_ENTITY_PROFILES` | `True` | P1：实体档案（`profile::<name>`）入池 |
 | `ENABLE_EXPAND_RERANK` | `False` | **P2 占位**，当前无实现 |
 | `LLM_TEMPERATURE` | `0.7` | MemWeaver 全部 LLM 调用统一温度 |
 
@@ -102,13 +140,15 @@ python scripts/fetch_locomo10.py                      # -> test_ref/locomo10.jso
 python test_locomo10.py --no-memweaver --llm-judge --parallel-questions \
     --result-file results/baseline_run1.json
 
-# Arm B：MemWeaver P0
+# Arm B：MemWeaver（P0 + P1）
 python test_locomo10.py --memweaver --llm-judge --parallel-questions \
     --result-file results/memweaver_run1.json
 
-# 消融
-python test_locomo10.py --memweaver --no-weaving --result-file results/mw_no_weaving.json
-python test_locomo10.py --memweaver --no-sweep    --result-file results/mw_no_sweep.json
+# 消融（每项对应论文消融表一行）
+python test_locomo10.py --memweaver --no-weaving   --result-file results/mw_no_weaving.json
+python test_locomo10.py --memweaver --no-sweep     --result-file results/mw_no_sweep.json
+python test_locomo10.py --memweaver --no-recontext --result-file results/mw_no_recontext.json
+python test_locomo10.py --memweaver --no-profiles  --result-file results/mw_no_profiles.json
 
 # 对比（温度 0.7 → 每 arm 跑 3 次，脚本按 arm 聚合 mean±std）
 python scripts/compare_locomo_results.py \
@@ -145,10 +185,18 @@ evidence，因此按词法对齐，并按**对话自身的 IDF** 加权：某条
 **arm 间的相对量**——完美检索也不会得 1.0，因为忠实的改写句会保留事实、
 丢掉寒暄。绝对水平请读 `retrieval_coverage`。
 
-## 7. 尚未实现（按设计留给后续阶段）
+## 7. 写侧健康指标（P1 新增）
 
-- P1：上下文继承嵌入（`context_digest` 字段已在数据模型里预留）、
-  `outdated_facts` 触发的重嵌入（P0 只把该信号计数进 `outdated_signals`）、
-  实体档案生成与入池；
-- P2：一跳证据扩展、交叉编码器平铺精排（`RERANK_TOP_K=20`）、
-  supersede 链在回答上下文中的相邻排布与 `[SUPERSEDED on <d> by Context N]` 标注。
+`summary.write_stats` 里除 P0 的兜底计数外新增：
+
+| 指标 | 含义 |
+|---|---|
+| `recontext_reembedded` | 因摘要重写而重嵌入的事实数（本地计算，零 API 成本） |
+| `recontext_up_to_date` | 被点名但指纹已是当前上下文、因此跳过的事实数（幂等命中） |
+| `profiles_written` | 写入的档案行数（≈ 说话人数 × session 数） |
+
+## 8. 尚未实现（按设计留给 P2）
+
+- 一跳证据扩展（supersede 链双向、weave 边双向、结构归属边）；
+- 交叉编码器平铺精排（`RERANK_TOP_K=20`）与扩展条目的 provenance 前缀打分；
+- supersede 链在回答上下文中的相邻排布与 `[SUPERSEDED on <d> by Context N]` 标注。

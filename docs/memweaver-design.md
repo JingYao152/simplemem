@@ -216,6 +216,17 @@ ENABLE_BUNDLE_RERANK / ENABLE_SUFFICIENCY_GATE。
 4. **实验归因**：MemWeaver 主表与消融在纯 core 管线上跑（evolver 不参与）；
    "EvolveMem 外环进化 MemWeaver 策略"留作扩展实验。
 
+**创新性边界（论文贡献声明的画法）**：读取管线中的三路检索、RRF 融合、
+题型格式化 prompt 均为 EvolveMem 已声称的成果（充分性门控思想亦有
+adaptive-retrieval 文献族），一律**不进贡献声明**，标注为继承组件并引用。
+声称的贡献严格限于：C1 写时自组织织物（线程/活体摘要/类型化编织）、
+C2 组织⇄表示协同演化（上下文继承嵌入 + 语义触发重嵌入）、C3 织物衍生
+的读取原语（as-of 时点检索与证据束——强调其存在依赖织物结构：无
+valid_until 即无 as-of，无 weave 边即无束）。时间锚本身不新，新的是锚
+作用于写时编织产生的有效期而非分数软衰减。
+**Baseline parity 纪律**：所有对照系统配备同一套非创新读侧组件
+（RRF + 题型 prompt + 门控）后再比较，使主表增量只能归因于 C1–C3。
+
 ## 11. LongMemEval 适配备注（暂缓，规则已定）
 
 - anchor 改用数据自带 question_date；`_abs` 弃答题由充分性门控天然处理；

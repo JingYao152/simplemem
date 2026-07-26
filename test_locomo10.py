@@ -1,6 +1,13 @@
 """
 LoComo10 Dataset Test for SimpleMem System
 Tests retrieval time, token usage, and answer quality
+
+The same harness runs both arms of the MemWeaver A/B (``--memweaver`` /
+``--no-memweaver``): identical retrieval base, identical answer prompt, and
+identical metrics, so differences are attributable to the write pipeline and its
+as-of retrieval. Besides end-to-end answer quality it measures retrieval hit
+rate directly from each QA's ``evidence`` field, which is available per question
+without waiting for end-to-end scores.
 """
 from pathlib import Path
 import time
@@ -21,6 +28,11 @@ from sentence_transformers.util import pytorch_cos_sim
 
 from main import SimpleMemSystem
 from simplemem.core.models.memory_entry import Dialogue
+from locomo_evidence import (
+    EVIDENCE_HIT_THRESHOLD,
+    RETRIEVAL_METRIC_KEYS,
+    EvidenceScorer,
+)
 
 # Download required NLTK data
 try:
@@ -331,11 +343,18 @@ def calculate_sentence_similarity(prediction: str, reference: str) -> float:
         print(f"Error calculating sentence similarity: {e}")
         return 0.0
 
+# ============================================================================
+# Retrieval Hit Rate from QA evidence (session / dia_id level)
+# ============================================================================
+# Implemented in locomo_evidence.py (stdlib only, unit-tested in
+# tests/test_evidence_retrieval.py) and reported next to answer quality below.
+
+
 def create_judge_llm_client():
     """Create a dedicated LLM client for judge evaluation"""
-    from utils.llm_client import LLMClient
-    import config
-    
+    from simplemem.core.utils.llm_client import LLMClient
+    from simplemem.core.settings import settings as config
+
     # Use judge-specific settings, fall back to main settings if not specified
     judge_api_key = getattr(config, 'JUDGE_API_KEY', None) or config.OPENAI_API_KEY
     judge_base_url = getattr(config, 'JUDGE_BASE_URL', None)
@@ -344,7 +363,7 @@ def create_judge_llm_client():
     judge_model = getattr(config, 'JUDGE_MODEL', None) or config.LLM_MODEL
     judge_thinking = getattr(config, 'JUDGE_ENABLE_THINKING', False)
     judge_streaming = getattr(config, 'JUDGE_USE_STREAMING', False)
-    
+
     print(f"Initializing LLM-as-judge with model: {judge_model}")
     if judge_base_url and judge_base_url != getattr(config, 'OPENAI_BASE_URL', None):
         print(f"Using separate judge endpoint: {judge_base_url}")
@@ -456,12 +475,12 @@ Return ONLY the JSON, no other text.
             }
         ]
         
-        import config
+        from simplemem.core.settings import settings as config
         # Use JSON format if configured
         response_format = None
-        if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
+        if getattr(config, 'USE_JSON_FORMAT', False):
             response_format = {"type": "json_object"}
-        
+
         # Use judge-specific temperature setting
         judge_temperature = getattr(config, 'JUDGE_TEMPERATURE', 0.3)
         
@@ -704,10 +723,10 @@ Return ONLY the JSON, no other text.
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                import config
+                from simplemem.core.settings import settings as config
                 # Use JSON format if configured
                 response_format = None
-                if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
+                if getattr(config, 'USE_JSON_FORMAT', False):
                     response_format = {"type": "json_object"}
 
                 response = self.system.llm_client.chat_completion(
@@ -776,25 +795,28 @@ Return ONLY the JSON, no other text.
         add_time = time.time() - add_start
         print(f"Memory building time: {add_time:.2f}s")
 
+        # Gold evidence turns of this sample, for retrieval hit rate
+        scorer = EvidenceScorer.from_sample(sample)
+
         # Test each question (parallel or sequential)
         if enable_parallel_questions and len(sample.qa) > 1:
-            sample_results = self._test_questions_parallel(sample.qa)
+            sample_results = self._test_questions_parallel(sample.qa, scorer)
         else:
-            sample_results = self._test_questions_sequential(sample.qa)
+            sample_results = self._test_questions_sequential(sample.qa, scorer)
 
         return sample_results
-    
-    def _test_questions_sequential(self, qa_list: List):
+
+    def _test_questions_sequential(self, qa_list: List, scorer: Optional[EvidenceScorer] = None):
         """Test questions sequentially (original method)"""
         sample_results = []
-        
+
         for qa_idx, qa in enumerate(qa_list):
-            result = self._process_single_question(qa, qa_idx)
+            result = self._process_single_question(qa, qa_idx, scorer)
             sample_results.append(result)
-            
+
         return sample_results
-    
-    def _test_questions_parallel(self, qa_list: List):
+
+    def _test_questions_parallel(self, qa_list: List, scorer: Optional[EvidenceScorer] = None):
         """Test questions in parallel using ThreadPoolExecutor"""
         import concurrent.futures
         
@@ -803,8 +825,8 @@ Return ONLY the JSON, no other text.
         
         # Use ThreadPoolExecutor for parallel question processing
         # Use explicit test_workers parameter, or config, or reasonable default
-        import config
-        
+        from simplemem.core.settings import settings as config
+
         if self.test_workers is not None:
             max_workers = self.test_workers
         else:
@@ -824,7 +846,7 @@ Return ONLY the JSON, no other text.
             # Submit all question processing tasks
             future_to_qa = {}
             for qa_idx, qa in enumerate(qa_list):
-                future = executor.submit(self._process_single_question, qa, qa_idx)
+                future = executor.submit(self._process_single_question, qa, qa_idx, scorer)
                 future_to_qa[future] = (qa, qa_idx)
             
             # Collect results as they complete, maintain order
@@ -856,7 +878,7 @@ Return ONLY the JSON, no other text.
         
         return sample_results
     
-    def _process_single_question(self, qa, qa_idx: int):
+    def _process_single_question(self, qa, qa_idx: int, scorer: Optional[EvidenceScorer] = None):
         """Process a single question and return result"""
         question = qa.question
         category = qa.category if qa.category is not None else 0
@@ -896,14 +918,19 @@ Return ONLY the JSON, no other text.
         # Calculate metrics
         if reference_answer:
             metrics = calculate_metrics(
-                answer, 
-                reference_answer, 
+                answer,
+                reference_answer,
                 question=question,
                 judge_client=self.judge_client,
                 use_llm_judge=self.use_llm_judge
             )
         else:
             metrics = {}
+
+        # Retrieval hit rate against the QA's gold evidence turns. Independent of
+        # answer quality: it scores the contexts the retriever returned.
+        retrieval_metrics = scorer.score(qa.evidence, contexts) if scorer else {}
+        metrics.update(retrieval_metrics)
 
         # Store statistics
         self.retrieval_times.append(retrieval_time)
@@ -919,6 +946,13 @@ Return ONLY the JSON, no other text.
         print(f"  Answer time: {answer_time:.3f}s")
         print(f"  Total time: {total_time:.3f}s")
         print(f"  Answer: {answer}")
+        if retrieval_metrics:
+            print(
+                f"  Evidence retrieval: hit_any={retrieval_metrics['retrieval_hit_any']:.0f}, "
+                f"hit_all={retrieval_metrics['retrieval_hit_all']:.0f}, "
+                f"coverage={retrieval_metrics['retrieval_coverage']:.3f} "
+                f"({int(retrieval_metrics['retrieval_evidence_count'])} evidence turns)"
+            )
         if reference_answer:
             print(f"  Reference: {reference_answer}")
             if metrics:
@@ -935,17 +969,31 @@ Return ONLY the JSON, no other text.
             'answer': answer,
             'reference': reference_answer,
             'category': category,
+            'evidence': list(qa.evidence or []),
             'retrieval_time': retrieval_time,
             'answer_time': answer_time,
             'total_time': total_time,
             'num_retrieved': len(contexts),
-            'metrics': metrics
+            'metrics': metrics,
+            'retrieval_metrics': retrieval_metrics
         }
+
+    def arm_name(self) -> str:
+        """Which A/B arm this run is: MemWeaver (with ablations) or baseline."""
+        weaver = getattr(self.system, 'memweaver', None)
+        if weaver is None:
+            return 'simplemem-baseline'
+        flags = []
+        if not weaver.enable_weaving:
+            flags.append('no-weaving')
+        if not weaver.enable_sweep:
+            flags.append('no-sweep')
+        return 'memweaver' + (f" ({', '.join(flags)})" if flags else '')
 
     def run_test(self, num_samples: int = None, save_results: bool = True, result_file: str = 'locomo10_test_results.json', enable_parallel_questions: bool = False):
         """Run full test on dataset"""
         print("\n" + "="*80)
-        print(" SimpleMem LoComo10 Dataset Test".center(80))
+        print(f" SimpleMem LoComo10 Dataset Test [{self.arm_name()}]".center(80))
         print("="*80 + "\n")
 
         # Load dataset
@@ -1002,7 +1050,37 @@ Return ONLY the JSON, no other text.
                     if 'f1' in category_data:
                         f1_mean = category_data['f1']['mean']
                         count = category_data['f1']['count']
-                        print(f"  Category {category_num}: F1={f1_mean:.4f} (n={count})")
+                        line = f"  Category {category_num}: F1={f1_mean:.4f} (n={count})"
+                        if self.use_llm_judge and 'llm_judge_score' in category_data:
+                            line += f", LLM-Judge={category_data['llm_judge_score']['mean']:.4f}"
+                        print(line)
+
+            # Retrieval hit rate from QA evidence (independent of answer quality)
+            if 'retrieval_hit_any' in overall:
+                print(f"\nRetrieval Hit Rate (QA evidence, dia_id level):")
+                for metric_name in RETRIEVAL_METRIC_KEYS:
+                    if metric_name in overall:
+                        stats = overall[metric_name]
+                        print(
+                            f"  {metric_name:26s}: {stats['mean']:.4f} "
+                            f"(±{stats['std']:.4f}, n={stats['count']})"
+                        )
+
+                print(f"\nRetrieval Hit Rate per Category:")
+                for key in sorted(aggregated.keys()):
+                    if not key.startswith('category_'):
+                        continue
+                    category_data = aggregated[key]
+                    if 'retrieval_hit_any' not in category_data:
+                        continue
+                    category_num = key.split('_')[1]
+                    print(
+                        f"  Category {category_num}: "
+                        f"hit_any={category_data['retrieval_hit_any']['mean']:.4f}, "
+                        f"hit_all={category_data['retrieval_hit_all']['mean']:.4f}, "
+                        f"coverage={category_data['retrieval_coverage']['mean']:.4f} "
+                        f"(n={category_data['retrieval_hit_any']['count']})"
+                    )
 
         # Save results
         if save_results:
@@ -1012,9 +1090,14 @@ Return ONLY the JSON, no other text.
                     'summary': {
                         'num_samples': total_samples,
                         'num_questions': len(all_results),
+                        'arm': self.arm_name(),
+                        'memweaver': bool(getattr(self.system, 'enable_memweaver', False)),
                         'avg_retrieval_time': sum(self.retrieval_times)/len(self.retrieval_times),
                         'avg_answer_time': sum(self.answer_times)/len(self.answer_times),
                         'avg_total_time': sum(self.total_times)/len(self.total_times),
+                        'evidence_hit_threshold': EVIDENCE_HIT_THRESHOLD,
+                        'write_stats': dict(self.system.memweaver.stats)
+                        if getattr(self.system, 'memweaver', None) else {},
                     },
                     'aggregated_metrics': aggregated if self.metrics_list else {},
                     'detailed_results': all_results
@@ -1047,15 +1130,32 @@ def main():
     parser.add_argument('--test-workers', type=int, default=None,
                        help='Number of parallel workers for question testing (default: use config MAX_RETRIEVAL_WORKERS)')
 
+    # MemWeaver A/B arms (docs/memweaver-design.md section 8). Both arms share
+    # this harness, the retrieval base and the answer prompt.
+    parser.add_argument('--memweaver', dest='memweaver', action='store_true', default=None,
+                       help='Arm B: MemWeaver fabric write pipeline + as-of retrieval')
+    parser.add_argument('--no-memweaver', dest='memweaver', action='store_false',
+                       help='Arm A: pure SimpleMem baseline (overrides config)')
+    parser.add_argument('--no-weaving', dest='weaving', action='store_false', default=None,
+                       help='Ablation: threads and summaries only, no weave operations')
+    parser.add_argument('--no-sweep', dest='sweep', action='store_false', default=None,
+                       help='Ablation: skip the finalize cross-thread supersede sweep')
+
     args = parser.parse_args()
 
     # Create system
     print("Initializing SimpleMem system...")
-    system = SimpleMemSystem(clear_db=True)
+    system = SimpleMemSystem(
+        clear_db=True,
+        enable_memweaver=args.memweaver,
+        enable_weaving=args.weaving,
+        enable_sweep=args.sweep
+    )
 
     # Create tester
     tester = LoCoMoTester(system, args.dataset, use_llm_judge=args.llm_judge, test_workers=args.test_workers)
-    
+
+    print(f"Arm: {tester.arm_name()}")
     if args.llm_judge:
         print("LLM-as-judge evaluation enabled")
     if args.test_workers:

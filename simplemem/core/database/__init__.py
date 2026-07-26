@@ -1,5 +1,8 @@
 from simplemem.core.database.vector_store import VectorStore
 from simplemem.core.database.vector_store_backend import (
+    FILTER_OPERATORS,
+    AnyOf,
+    FieldPredicate,
     LanceDBVectorStoreBackend,
     ScoreOrder,
     VectorStoreBackend,
@@ -8,6 +11,9 @@ from simplemem.core.database.vector_store_backend import (
 )
 
 __all__ = [
+    "AnyOf",
+    "FieldPredicate",
+    "FILTER_OPERATORS",
     "LanceDBVectorStoreBackend",
     "ScoreOrder",
     "VectorStore",

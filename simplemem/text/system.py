@@ -8,6 +8,7 @@ from simplemem.core.utils.llm_client import LLMClient
 from simplemem.core.utils.embedding import EmbeddingModel
 from simplemem.core.database.vector_store import VectorStore
 from simplemem.core.memory_builder import MemoryBuilder
+from simplemem.core.memweaver import MemWeaver
 from simplemem.core.hybrid_retriever import HybridRetriever
 from simplemem.core.answer_generator import AnswerGenerator
 
@@ -22,6 +23,10 @@ class SimpleMemSystem:
     1. Semantic Structured Compression (Section 3.1): add_dialogue() -> MemoryBuilder -> VectorStore
     2. Online Semantic Synthesis (Section 3.2): Intra-session consolidation during write
     3. Intent-Aware Retrieval Planning (Section 3.3): ask() -> HybridRetriever -> AnswerGenerator
+
+    With MemWeaver enabled (docs/memweaver-design.md), stages 1-2 are replaced by
+    the session-atomic Call A/B fabric pipeline and the retrieval base gains
+    as-of validity filtering; everything else stays SimpleMem-native.
     """
     def __init__(
         self,
@@ -39,7 +44,10 @@ class SimpleMemSystem:
         enable_parallel_processing: Optional[bool] = None,
         max_parallel_workers: Optional[int] = None,
         enable_parallel_retrieval: Optional[bool] = None,
-        max_retrieval_workers: Optional[int] = None
+        max_retrieval_workers: Optional[int] = None,
+        enable_memweaver: Optional[bool] = None,
+        enable_weaving: Optional[bool] = None,
+        enable_sweep: Optional[bool] = None
     ):
         """
         Initialize system
@@ -60,6 +68,9 @@ class SimpleMemSystem:
         - max_parallel_workers: Maximum number of parallel workers for memory building (None=use config default)
         - enable_parallel_retrieval: Enable parallel processing for retrieval queries (None=use config default)
         - max_retrieval_workers: Maximum number of parallel workers for retrieval (None=use config default)
+        - enable_memweaver: Use the MemWeaver fabric write pipeline + as-of retrieval (None=use config default)
+        - enable_weaving: Enable typed weave operations (ablation switch, None=use config default)
+        - enable_sweep: Enable the finalize cross-thread sweep (ablation switch, None=use config default)
         """
         print("=" * 60)
         print("Initializing SimpleMem System")
@@ -92,6 +103,31 @@ class SimpleMemSystem:
             max_parallel_workers=max_parallel_workers
         )
 
+        self.enable_memweaver = (
+            enable_memweaver
+            if enable_memweaver is not None
+            else getattr(config, 'ENABLE_MEMWEAVER', False)
+        )
+        self.memweaver: Optional[MemWeaver] = None
+        if self.enable_memweaver:
+            self.memweaver = MemWeaver(
+                llm_client=self.llm_client,
+                vector_store=self.vector_store,
+                enable_weaving=enable_weaving,
+                enable_sweep=enable_sweep,
+                max_parallel_workers=max_parallel_workers,
+                fallback_extractor=self.memory_builder
+            )
+            print(
+                "\nMemWeaver write pipeline enabled "
+                f"(weaving={self.memweaver.enable_weaving}, "
+                f"sweep={self.memweaver.enable_sweep}, "
+                f"temperature={self.memweaver.temperature})"
+            )
+
+        # The component the write path routes to (MemoryBuilder = pure SimpleMem)
+        self.writer = self.memweaver or self.memory_builder
+
         self.hybrid_retriever = HybridRetriever(
             llm_client=self.llm_client,
             vector_store=self.vector_store,
@@ -99,7 +135,8 @@ class SimpleMemSystem:
             enable_reflection=enable_reflection,
             max_reflection_rounds=max_reflection_rounds,
             enable_parallel_retrieval=enable_parallel_retrieval,
-            max_retrieval_workers=max_retrieval_workers
+            max_retrieval_workers=max_retrieval_workers,
+            enable_memweaver=self.enable_memweaver
         )
 
         self.answer_generator = AnswerGenerator(
@@ -118,14 +155,14 @@ class SimpleMemSystem:
         - content: Dialogue content
         - timestamp: Timestamp (ISO 8601 format)
         """
-        dialogue_id = self.memory_builder.processed_count + len(self.memory_builder.dialogue_buffer) + 1
+        dialogue_id = self.writer.processed_count + len(self.writer.dialogue_buffer) + 1
         dialogue = Dialogue(
             dialogue_id=dialogue_id,
             speaker=speaker,
             content=content,
             timestamp=timestamp
         )
-        self.memory_builder.add_dialogue(dialogue)
+        self.writer.add_dialogue(dialogue)
 
     def add_dialogues(self, dialogues: List[Dialogue]):
         """
@@ -134,14 +171,20 @@ class SimpleMemSystem:
         Args:
         - dialogues: List of dialogues
         """
-        self.memory_builder.add_dialogues(dialogues)
+        self.writer.add_dialogues(dialogues)
 
     def finalize(self):
         """
         Finalize dialogue input, process any remaining buffer (safety check)
         Note: In parallel mode, remaining dialogues are already processed
+
+        With MemWeaver enabled this also runs the cross-thread supersede sweep
+        and optimizes the store.
         """
-        self.memory_builder.process_remaining()
+        if self.memweaver is not None:
+            self.memweaver.finalize()
+        else:
+            self.memory_builder.process_remaining()
 
     def ask(self, question: str) -> str:
         """
@@ -212,7 +255,10 @@ def create_system(
     enable_parallel_processing: Optional[bool] = None,
     max_parallel_workers: Optional[int] = None,
     enable_parallel_retrieval: Optional[bool] = None,
-    max_retrieval_workers: Optional[int] = None
+    max_retrieval_workers: Optional[int] = None,
+    enable_memweaver: Optional[bool] = None,
+    enable_weaving: Optional[bool] = None,
+    enable_sweep: Optional[bool] = None
 ) -> SimpleMemSystem:
     """
     Create SimpleMem system instance (uses config.py defaults when None)
@@ -225,7 +271,10 @@ def create_system(
         enable_parallel_processing=enable_parallel_processing,
         max_parallel_workers=max_parallel_workers,
         enable_parallel_retrieval=enable_parallel_retrieval,
-        max_retrieval_workers=max_retrieval_workers
+        max_retrieval_workers=max_retrieval_workers,
+        enable_memweaver=enable_memweaver,
+        enable_weaving=enable_weaving,
+        enable_sweep=enable_sweep
     )
 
 

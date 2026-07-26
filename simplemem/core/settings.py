@@ -37,6 +37,14 @@ _DEFAULTS = {
     "ENABLE_PLANNING": True,
     "ENABLE_REFLECTION": True,
     "MAX_REFLECTION_ROUNDS": 2,
+    # MemWeaver (docs/memweaver-design.md). Ablation switches, one per row of the
+    # paper's ablation table; LLM_TEMPERATURE applies to every MemWeaver call.
+    "ENABLE_MEMWEAVER": False,
+    "ENABLE_WEAVING": True,
+    "ENABLE_SWEEP": True,
+    "ENABLE_RECONTEXT": False,
+    "ENABLE_EXPAND_RERANK": False,
+    "LLM_TEMPERATURE": 0.7,
 }
 
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 import os
 import re
+import threading
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 import lancedb
@@ -15,6 +16,37 @@ class ScoreOrder(str, Enum):
 
     ASCENDING = "ascending"
     DESCENDING = "descending"
+
+
+#: Comparison operators a filter predicate may use.
+FILTER_OPERATORS = frozenset({"=", "!=", ">", ">=", "<", "<="})
+
+
+@dataclass(frozen=True)
+class FieldPredicate:
+    """A single comparison against one metadata field."""
+
+    op: str
+    value: Any
+
+    def __post_init__(self) -> None:
+        if self.op not in FILTER_OPERATORS:
+            raise ValueError(f"Unsupported filter operator: {self.op!r}")
+
+
+@dataclass(frozen=True)
+class AnyOf:
+    """Disjunction of predicates over one metadata field.
+
+    MemWeaver's as-of filter needs it: an entry is visible at the anchor when
+    ``valid_until = ''`` (still open) OR ``valid_until >= anchor``.
+    """
+
+    predicates: Sequence[FieldPredicate]
+
+    def __post_init__(self) -> None:
+        if not self.predicates:
+            raise ValueError("AnyOf requires at least one predicate")
 
 
 @dataclass(frozen=True)
@@ -81,6 +113,21 @@ class VectorStoreBackend(Protocol):
         """Return every stored record."""
         ...
 
+    def get_by_ids(
+        self,
+        entry_ids: Sequence[str],
+    ) -> List[VectorStoreSearchResult]:
+        """Return the records with the given ids (missing ids are skipped)."""
+        ...
+
+    def update_metadata(self, entry_id: str, fields: Dict[str, Any]) -> None:
+        """Update metadata fields of one stored record in place."""
+        ...
+
+    def delete_by_ids(self, entry_ids: Sequence[str]) -> None:
+        """Delete the records with the given ids."""
+        ...
+
     def optimize(self) -> None:
         """Optimize backend indexes after bulk insertion."""
         ...
@@ -107,7 +154,12 @@ class LanceDBVectorStoreBackend:
         self.db_path = db_path
         self.table_name = table_name
         self.vector_dimension = vector_dimension
-        self._fts_initialized = False
+        # The full-text index is not maintained incrementally by LanceDB, so any
+        # mutation marks it stale and the next lexical query rebuilds it. This
+        # matters for MemWeaver, which writes once per session instead of once
+        # per run.
+        self._fts_dirty = True
+        self._write_lock = threading.Lock()
         self._is_cloud_storage = self.db_path.startswith(("gs://", "s3://", "az://"))
 
         if self._is_cloud_storage:
@@ -132,6 +184,14 @@ class LanceDBVectorStoreBackend:
                 pa.field("persons", pa.list_(pa.string())),
                 pa.field("entities", pa.list_(pa.string())),
                 pa.field("topic", pa.string()),
+                # MemWeaver fabric fields (design doc section 2)
+                pa.field("kind", pa.string()),
+                pa.field("thread_id", pa.string()),
+                pa.field("valid_from", pa.string()),
+                pa.field("valid_until", pa.string()),
+                pa.field("superseded_by", pa.string()),
+                pa.field("links", pa.list_(pa.string())),
+                pa.field("context_digest", pa.string()),
                 pa.field(
                     "vector",
                     pa.list_(pa.float32(), self.vector_dimension),
@@ -145,30 +205,60 @@ class LanceDBVectorStoreBackend:
         else:
             self.table = self.db.open_table(self.table_name)
             print(f"Opened existing table: {self.table_name}")
+            self._migrate_table(schema)
 
-    def _init_fts_index(self) -> None:
-        if self._fts_initialized:
+    def _migrate_table(self, schema: pa.Schema) -> None:
+        """Add fabric columns to a table created before MemWeaver."""
+        existing = set(self.table.schema.names)
+        missing = [field for field in schema if field.name not in existing]
+        if not missing:
             return
 
-        try:
-            if self._is_cloud_storage:
-                self.table.create_fts_index(
-                    "lossless_restatement",
-                    use_tantivy=False,
-                    replace=True,
-                )
-                print("FTS index created (native mode for cloud storage)")
-            else:
-                self.table.create_fts_index(
-                    "lossless_restatement",
-                    use_tantivy=True,
-                    tokenizer_name="en_stem",
-                    replace=True,
-                )
-                print("FTS index created (Tantivy mode)")
-            self._fts_initialized = True
-        except Exception as error:
-            print(f"FTS index creation skipped: {error}")
+        for field in missing:
+            try:
+                if pa.types.is_string(field.type):
+                    # SQL literal default keeps the column non-null for old rows.
+                    self.table.add_columns({field.name: "''"})
+                else:
+                    self.table.add_columns(field)
+            except Exception as error:
+                raise RuntimeError(
+                    f"Failed to migrate table {self.table_name!r}: cannot add "
+                    f"column {field.name!r} ({error}). Clear the table to "
+                    "recreate it with the current schema."
+                ) from error
+        print(
+            f"Migrated table {self.table_name}: added "
+            f"{', '.join(field.name for field in missing)}"
+        )
+
+    def _ensure_fts_index(self) -> None:
+        """(Re)build the full-text index when it is stale."""
+        with self._write_lock:
+            if not self._fts_dirty:
+                return
+            if self.table.count_rows() == 0:
+                return
+
+            try:
+                if self._is_cloud_storage:
+                    self.table.create_fts_index(
+                        "lossless_restatement",
+                        use_tantivy=False,
+                        replace=True,
+                    )
+                    print("FTS index created (native mode for cloud storage)")
+                else:
+                    self.table.create_fts_index(
+                        "lossless_restatement",
+                        use_tantivy=True,
+                        tokenizer_name="en_stem",
+                        replace=True,
+                    )
+                    print("FTS index created (Tantivy mode)")
+                self._fts_dirty = False
+            except Exception as error:
+                print(f"FTS index creation skipped: {error}")
 
     def insert(self, records: Sequence[VectorStoreRecord]) -> None:
         if not records:
@@ -182,8 +272,9 @@ class LanceDBVectorStoreBackend:
             }
             for record in records
         ]
-        self.table.add(rows)
-        self._init_fts_index()
+        with self._write_lock:
+            self.table.add(rows)
+            self._fts_dirty = True
 
     def semantic_search(
         self,
@@ -213,6 +304,7 @@ class LanceDBVectorStoreBackend:
         if not keywords or self.count() == 0:
             return []
 
+        self._ensure_fts_index()
         query = " ".join(keywords)
         results = self._rows_to_results(
             self.table.search(query).limit(top_k).to_list(),
@@ -261,12 +353,53 @@ class LanceDBVectorStoreBackend:
     def get_all(self) -> List[VectorStoreSearchResult]:
         return self._rows_to_results(self.table.to_arrow().to_pylist())
 
+    def get_by_ids(
+        self,
+        entry_ids: Sequence[str],
+    ) -> List[VectorStoreSearchResult]:
+        if not entry_ids or self.count() == 0:
+            return []
+
+        values = ", ".join(self._quote(entry_id) for entry_id in entry_ids)
+        rows = self.table.search().where(f"entry_id IN ({values})").to_list()
+        results = self._rows_to_results(rows)
+
+        # Preserve the caller's id order; drop ids that no longer exist.
+        by_id = {result.entry_id: result for result in results}
+        return [by_id[entry_id] for entry_id in entry_ids if entry_id in by_id]
+
+    def update_metadata(self, entry_id: str, fields: Dict[str, Any]) -> None:
+        if not fields:
+            return
+
+        for field in fields:
+            if not self._field_pattern.fullmatch(field):
+                raise ValueError(f"Invalid metadata field: {field!r}")
+        if "entry_id" in fields or "vector" in fields:
+            raise ValueError("entry_id and vector cannot be updated in place")
+
+        with self._write_lock:
+            self.table.update(
+                where=f"entry_id = {self._quote(entry_id)}",
+                values=dict(fields),
+            )
+            self._fts_dirty = True
+
+    def delete_by_ids(self, entry_ids: Sequence[str]) -> None:
+        if not entry_ids:
+            return
+
+        values = ", ".join(self._quote(entry_id) for entry_id in entry_ids)
+        with self._write_lock:
+            self.table.delete(f"entry_id IN ({values})")
+            self._fts_dirty = True
+
     def optimize(self) -> None:
         self.table.optimize()
 
     def clear(self) -> None:
         self.db.drop_table(self.table_name)
-        self._fts_initialized = False
+        self._fts_dirty = True
         self._init_table()
 
     @classmethod
@@ -275,8 +408,20 @@ class LanceDBVectorStoreBackend:
         for field, value in filters.items():
             if not cls._field_pattern.fullmatch(field):
                 raise ValueError(f"Invalid semantic filter field: {field!r}")
-            conditions.append(f"{field} = {cls._format_filter_value(value)}")
+            conditions.append(cls._build_field_condition(field, value))
         return " AND ".join(conditions)
+
+    @classmethod
+    def _build_field_condition(cls, field: str, value: Any) -> str:
+        if isinstance(value, AnyOf):
+            clauses = [
+                cls._build_field_condition(field, predicate)
+                for predicate in value.predicates
+            ]
+            return "(" + " OR ".join(clauses) + ")"
+        if isinstance(value, FieldPredicate):
+            return f"{field} {value.op} {cls._format_filter_value(value.value)}"
+        return f"{field} = {cls._format_filter_value(value)}"
 
     @classmethod
     def _format_filter_value(cls, value: Any) -> str:

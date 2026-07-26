@@ -10,6 +10,12 @@ from typing import List, Optional, Dict, Any
 from simplemem.core.models.memory_entry import MemoryEntry
 from simplemem.core.utils.llm_client import LLMClient
 from simplemem.core.database.vector_store import VectorStore
+from simplemem.core.memweaver.asof import (
+    apply_asof,
+    asof_filters,
+    compute_anchor,
+    is_temporal_history_question,
+)
 from simplemem.core.settings import settings as config
 import re
 from datetime import datetime, timedelta
@@ -40,14 +46,24 @@ class HybridRetriever:
         enable_reflection: bool = True,
         max_reflection_rounds: int = 2,
         enable_parallel_retrieval: bool = True,
-        max_retrieval_workers: int = 3
+        max_retrieval_workers: int = 3,
+        enable_memweaver: Optional[bool] = None
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
         self.semantic_top_k = semantic_top_k or config.SEMANTIC_TOP_K
         self.keyword_top_k = keyword_top_k or config.KEYWORD_TOP_K
         self.structured_top_k = structured_top_k or config.STRUCTURED_TOP_K
-        
+
+        # MemWeaver's only read-side overlay in P0: as-of validity filtering
+        # (design doc section 5). The retrieval base itself is untouched.
+        self.enable_memweaver = (
+            enable_memweaver
+            if enable_memweaver is not None
+            else getattr(config, 'ENABLE_MEMWEAVER', False)
+        )
+        self._anchor_cache: Optional[tuple] = None
+
         # Use config values as default if not explicitly provided
         self.enable_planning = enable_planning if enable_planning is not None else getattr(config, 'ENABLE_PLANNING', True)
         self.enable_reflection = enable_reflection if enable_reflection is not None else getattr(config, 'ENABLE_REFLECTION', True)
@@ -70,8 +86,55 @@ class HybridRetriever:
             return self._retrieve_with_planning(query, enable_reflection)
         else:
             # Fallback to simple semantic search
-            return self._semantic_search(query)
-    
+            return self._semantic_search(query, as_of=self._resolve_as_of(query))
+
+    # ------------------------------------------------------------------
+    # As-of retrieval (MemWeaver C3, design doc section 5)
+    # ------------------------------------------------------------------
+
+    def _resolve_as_of(self, query: str) -> str:
+        """Time anchor to filter by, or "" when no filtering applies.
+
+        Structural rules only: the anchor is the memory's largest session date
+        (LoCoMo QA has no question_date), and "when"-type questions skip the
+        filter because asking about history needs the closed facts.
+        """
+        if not self.enable_memweaver:
+            return ""
+        if is_temporal_history_question(query):
+            print("[As-of] Temporal-history question: validity filter skipped")
+            return ""
+
+        anchor = self._current_anchor()
+        if anchor:
+            print(f"[As-of] Anchor {anchor}: only entries valid at the anchor")
+        return anchor
+
+    def _current_anchor(self) -> str:
+        """Largest session date in the memory, cached per store revision.
+
+        The cache key is the store's mutation counter, so rebuilding the memory
+        for another sample (clear + rewrite) always invalidates it.
+        """
+        revision = getattr(self.vector_store, 'revision', None)
+
+        if (
+            self._anchor_cache is not None
+            and revision is not None
+            and self._anchor_cache[0] == revision
+        ):
+            return self._anchor_cache[1]
+
+        try:
+            anchor = compute_anchor(self.vector_store.get_all_entries())
+        except Exception as error:
+            print(f"Failed to compute as-of anchor: {error}")
+            return ""
+
+        if revision is not None:
+            self._anchor_cache = (revision, anchor)
+        return anchor
+
     def _retrieve_with_planning(self, query: str, enable_reflection: Optional[bool] = None) -> List[MemoryEntry]:
         """
         Execute retrieval with intelligent planning process
@@ -81,35 +144,38 @@ class HybridRetriever:
         - enable_reflection: Override reflection setting for this query
         """
         print(f"\n[Planning] Analyzing information requirements for: {query}")
-        
+
+        # As-of anchor for this question (empty = no validity filtering)
+        as_of = self._resolve_as_of(query)
+
         # Step 1: Intelligent analysis of what information is needed
         information_plan = self._analyze_information_requirements(query)
         print(f"[Planning] Identified {len(information_plan['required_info'])} information requirements")
-        
+
         # Step 2: Generate minimal necessary queries based on the plan
         search_queries = self._generate_targeted_queries(query, information_plan)
         print(f"[Planning] Generated {len(search_queries)} targeted queries")
-        
+
         # Step 3: Execute searches for all queries (parallel or sequential)
         if self.enable_parallel_retrieval and len(search_queries) > 1:
-            all_results = self._execute_parallel_searches(search_queries)
+            all_results = self._execute_parallel_searches(search_queries, as_of=as_of)
         else:
             all_results = []
             for i, search_query in enumerate(search_queries, 1):
                 print(f"[Search {i}] {search_query}")
-                results = self._semantic_search(search_query)
+                results = self._semantic_search(search_query, as_of=as_of)
                 all_results.extend(results)
 
         # Step 3.5: Execute keyword and structured searches (hybrid retrieval)
         query_analysis = self._analyze_query(query)
 
         # Keyword search (Lexical Layer)
-        keyword_results = self._keyword_search(query, query_analysis)
+        keyword_results = self._keyword_search(query, query_analysis, as_of=as_of)
         print(f"[Keyword Search] Found {len(keyword_results)} results")
         all_results.extend(keyword_results)
 
         # Structured search (Symbolic Layer)
-        structured_results = self._structured_search(query_analysis)
+        structured_results = self._structured_search(query_analysis, as_of=as_of)
         print(f"[Structured Search] Found {len(structured_results)} results")
         all_results.extend(structured_results)
 
@@ -122,11 +188,13 @@ class HybridRetriever:
         should_use_reflection = enable_reflection if enable_reflection is not None else self.enable_reflection
         
         if should_use_reflection:
-            merged_results = self._retrieve_with_intelligent_reflection(query, merged_results, information_plan)
-        
+            merged_results = self._retrieve_with_intelligent_reflection(
+                query, merged_results, information_plan, as_of=as_of
+            )
+
         return merged_results
-    
-    def _retrieve_with_reflection(self, query: str, initial_results: List[MemoryEntry]) -> List[MemoryEntry]:
+
+    def _retrieve_with_reflection(self, query: str, initial_results: List[MemoryEntry], as_of: str = "") -> List[MemoryEntry]:
         """
         Execute reflection-based additional retrieval
         """
@@ -154,12 +222,12 @@ class HybridRetriever:
                 # Execute additional searches (parallel or sequential)
                 if self.enable_parallel_retrieval and len(additional_queries) > 1:
                     print(f"[Reflection Round {round_num + 1}] Executing {len(additional_queries)} additional queries in parallel")
-                    additional_results = self._execute_parallel_additional_searches(additional_queries, round_num + 1)
+                    additional_results = self._execute_parallel_additional_searches(additional_queries, round_num + 1, as_of=as_of)
                 else:
                     additional_results = []
                     for i, add_query in enumerate(additional_queries, 1):
                         print(f"[Additional Search {i}] {add_query}")
-                        results = self._semantic_search(add_query)
+                        results = self._semantic_search(add_query, as_of=as_of)
                         additional_results.extend(results)
                 
                 # Merge with existing results
@@ -238,17 +306,25 @@ Return ONLY JSON, no other content.
                         "entities": []
                     }
 
-    def _semantic_search(self, query: str) -> List[MemoryEntry]:
+    def _semantic_search(self, query: str, as_of: str = "") -> List[MemoryEntry]:
         """
         Semantic Layer Retrieval (Section 3.3)
         R_sem = Top-n(cos(E(q_sem), E(m_i)))
+
+        The as-of predicate is pushed down as a prefilter so the top-k budget is
+        spent on entries that are still valid at the anchor.
         """
-        return self.vector_store.semantic_search(query, top_k=self.semantic_top_k)
+        return self.vector_store.semantic_search(
+            query,
+            top_k=self.semantic_top_k,
+            filters=asof_filters(as_of) if as_of else None,
+        )
 
     def _keyword_search(
         self,
         query: str,
-        query_analysis: Dict[str, Any]
+        query_analysis: Dict[str, Any],
+        as_of: str = ""
     ) -> List[MemoryEntry]:
         """
         Lexical Layer Retrieval (Section 3.3)
@@ -259,9 +335,12 @@ Return ONLY JSON, no other content.
             # If no keywords extracted, use query itself
             keywords = [query]
 
-        return self.vector_store.keyword_search(keywords, top_k=self.keyword_top_k)
+        results = self.vector_store.keyword_search(keywords, top_k=self.keyword_top_k)
+        # The full-text path cannot prefilter, so the same predicate is applied
+        # to its results to keep the candidate pool time-consistent.
+        return apply_asof(results, as_of) if as_of else results
 
-    def _structured_search(self, query_analysis: Dict[str, Any]) -> List[MemoryEntry]:
+    def _structured_search(self, query_analysis: Dict[str, Any], as_of: str = "") -> List[MemoryEntry]:
         """
         Symbolic Layer Retrieval (Section 3.3)
         R_sym = Top-n({m_i | Meta(m_i) ⊨ q_sym})
@@ -281,13 +360,14 @@ Return ONLY JSON, no other content.
             return []
 
         # Execute structured search
-        return self.vector_store.structured_search(
+        results = self.vector_store.structured_search(
             persons=persons if persons else None,
             location=location,
             entities=entities if entities else None,
             timestamp_range=timestamp_range,
             top_k=self.structured_top_k
         )
+        return apply_asof(results, as_of) if as_of else results
 
     def _parse_time_range(self, time_expression: str) -> Optional[tuple]:
         """
@@ -556,20 +636,20 @@ Return ONLY the JSON, no other text.
         
         return "\n".join(formatted)
     
-    def _execute_parallel_searches(self, search_queries: List[str]) -> List[MemoryEntry]:
+    def _execute_parallel_searches(self, search_queries: List[str], as_of: str = "") -> List[MemoryEntry]:
         """
         Execute multiple search queries in parallel using ThreadPoolExecutor
         """
         print(f"[Parallel Search] Executing {len(search_queries)} queries in parallel with {self.max_retrieval_workers} workers")
         all_results = []
-        
+
         try:
             # Use ThreadPoolExecutor for parallel retrieval
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
                 # Submit all search tasks
                 future_to_query = {}
                 for i, query in enumerate(search_queries, 1):
-                    future = executor.submit(self._semantic_search_worker, query, i)
+                    future = executor.submit(self._semantic_search_worker, query, i, as_of)
                     future_to_query[future] = (query, i)
                 
                 # Collect results as they complete
@@ -588,33 +668,33 @@ Return ONLY the JSON, no other text.
             for i, query in enumerate(search_queries, 1):
                 try:
                     print(f"[Sequential Search {i}] {query}")
-                    results = self._semantic_search(query)
+                    results = self._semantic_search(query, as_of=as_of)
                     all_results.extend(results)
                 except Exception as search_e:
                     print(f"[Sequential Search {i}] Failed: {search_e}")
-        
+
         return all_results
-    
-    def _semantic_search_worker(self, query: str, query_num: int) -> List[MemoryEntry]:
+
+    def _semantic_search_worker(self, query: str, query_num: int, as_of: str = "") -> List[MemoryEntry]:
         """
         Worker function for parallel semantic search
         """
         print(f"[Search {query_num}] {query}")
-        return self._semantic_search(query)
-    
-    def _execute_parallel_additional_searches(self, additional_queries: List[str], round_num: int) -> List[MemoryEntry]:
+        return self._semantic_search(query, as_of=as_of)
+
+    def _execute_parallel_additional_searches(self, additional_queries: List[str], round_num: int, as_of: str = "") -> List[MemoryEntry]:
         """
         Execute additional reflection queries in parallel
         """
         all_results = []
-        
+
         try:
             # Use ThreadPoolExecutor for parallel retrieval
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
                 # Submit all search tasks
                 future_to_query = {}
                 for i, query in enumerate(additional_queries, 1):
-                    future = executor.submit(self._additional_search_worker, query, i, round_num)
+                    future = executor.submit(self._additional_search_worker, query, i, round_num, as_of)
                     future_to_query[future] = (query, i)
                 
                 # Collect results as they complete
@@ -633,19 +713,19 @@ Return ONLY the JSON, no other text.
             for i, query in enumerate(additional_queries, 1):
                 try:
                     print(f"[Additional Search {i}] {query}")
-                    results = self._semantic_search(query)
+                    results = self._semantic_search(query, as_of=as_of)
                     all_results.extend(results)
                 except Exception as search_e:
                     print(f"[Additional Search {i}] Failed: {search_e}")
-        
+
         return all_results
-    
-    def _additional_search_worker(self, query: str, query_num: int, round_num: int) -> List[MemoryEntry]:
+
+    def _additional_search_worker(self, query: str, query_num: int, round_num: int, as_of: str = "") -> List[MemoryEntry]:
         """
         Worker function for parallel additional search in reflection
         """
         print(f"[Additional Search {query_num}] {query}")
-        return self._semantic_search(query)
+        return self._semantic_search(query, as_of=as_of)
     
     def _analyze_information_requirements(self, query: str) -> Dict[str, Any]:
         """
@@ -791,7 +871,7 @@ Return ONLY the JSON, no other text.
             # Fallback to original query
             return [original_query]
     
-    def _retrieve_with_intelligent_reflection(self, query: str, initial_results: List[MemoryEntry], information_plan: Dict[str, Any]) -> List[MemoryEntry]:
+    def _retrieve_with_intelligent_reflection(self, query: str, initial_results: List[MemoryEntry], information_plan: Dict[str, Any], as_of: str = "") -> List[MemoryEntry]:
         """
         Execute intelligent reflection-based additional retrieval
         """
@@ -819,12 +899,12 @@ Return ONLY the JSON, no other text.
                 # Execute additional searches
                 if self.enable_parallel_retrieval and len(additional_queries) > 1:
                     print(f"[Intelligent Reflection Round {round_num + 1}] Executing {len(additional_queries)} queries in parallel")
-                    additional_results = self._execute_parallel_additional_searches(additional_queries, round_num + 1)
+                    additional_results = self._execute_parallel_additional_searches(additional_queries, round_num + 1, as_of=as_of)
                 else:
                     additional_results = []
                     for i, add_query in enumerate(additional_queries, 1):
                         print(f"[Additional Search {i}] {add_query}")
-                        results = self._semantic_search(add_query)
+                        results = self._semantic_search(add_query, as_of=as_of)
                         additional_results.extend(results)
                 
                 # Merge with existing results

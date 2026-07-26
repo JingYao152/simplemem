@@ -165,6 +165,25 @@ class InMemoryVectorStoreBackend:
     def get_all(self):
         return [self._result(record) for record in self.records]
 
+    def get_by_ids(self, entry_ids):
+        by_id = {record.entry_id: record for record in self.records}
+        return [
+            self._result(by_id[entry_id])
+            for entry_id in entry_ids
+            if entry_id in by_id
+        ]
+
+    def update_metadata(self, entry_id, fields):
+        for record in self.records:
+            if record.entry_id == entry_id:
+                record.metadata.update(fields)
+
+    def delete_by_ids(self, entry_ids):
+        removed = set(entry_ids)
+        self.records = [
+            record for record in self.records if record.entry_id not in removed
+        ]
+
     def optimize(self):
         self.optimized = True
 
@@ -191,6 +210,9 @@ class TrackingVectorStoreBackend:
             "keyword_search": 0,
             "structured_search": 0,
             "get_all": 0,
+            "get_by_ids": 0,
+            "update_metadata": 0,
+            "delete_by_ids": 0,
             "optimize": 0,
             "clear": 0,
         }
@@ -219,6 +241,18 @@ class TrackingVectorStoreBackend:
     def get_all(self):
         self.calls["get_all"] += 1
         return self.delegate.get_all()
+
+    def get_by_ids(self, entry_ids):
+        self.calls["get_by_ids"] += 1
+        return self.delegate.get_by_ids(entry_ids)
+
+    def update_metadata(self, entry_id, fields):
+        self.calls["update_metadata"] += 1
+        self.delegate.update_metadata(entry_id, fields)
+
+    def delete_by_ids(self, entry_ids):
+        self.calls["delete_by_ids"] += 1
+        self.delegate.delete_by_ids(entry_ids)
 
     def optimize(self):
         self.calls["optimize"] += 1

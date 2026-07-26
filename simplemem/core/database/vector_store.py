@@ -8,7 +8,7 @@ from simplemem.core.database.vector_store_backend import (
     VectorStoreRecord,
     VectorStoreSearchResult,
 )
-from simplemem.core.models.memory_entry import MemoryEntry
+from simplemem.core.models.memory_entry import KIND_FACT, MemoryEntry
 from simplemem.core.settings import settings as config
 from simplemem.core.utils.embedding import EmbeddingModel
 
@@ -18,6 +18,26 @@ BackendFactory = Callable[[int], VectorStoreBackend]
 
 class VectorStore:
     """Coordinate embeddings with a pluggable multi-view storage backend."""
+
+    #: Metadata fields a stored entry carries (MemWeaver fabric fields included).
+    METADATA_FIELDS = frozenset(
+        {
+            "lossless_restatement",
+            "keywords",
+            "timestamp",
+            "location",
+            "persons",
+            "entities",
+            "topic",
+            "kind",
+            "thread_id",
+            "valid_from",
+            "valid_until",
+            "superseded_by",
+            "links",
+            "context_digest",
+        }
+    )
 
     def __init__(
         self,
@@ -31,6 +51,9 @@ class VectorStore:
         self.embedding_model = embedding_model or EmbeddingModel()
         self.table_name = table_name or config.MEMORY_TABLE_NAME
         self.storage_options = storage_options
+        # Bumped on every mutation so readers can cache derived state (such as
+        # MemWeaver's as-of anchor) without rescanning the table.
+        self._revision = 0
 
         if backend_factory is None:
             self.backend = LanceDBVectorStoreBackend(
@@ -41,6 +64,11 @@ class VectorStore:
             )
         else:
             self.backend = backend_factory(self.embedding_model.dimension)
+
+    @property
+    def revision(self) -> int:
+        """Monotonic counter of mutations applied through this facade."""
+        return self._revision
 
     @property
     def db(self) -> Any:
@@ -63,24 +91,26 @@ class VectorStore:
             VectorStoreRecord(
                 entry_id=entry.entry_id,
                 vector=vector.tolist(),
-                metadata={
-                    "lossless_restatement": entry.lossless_restatement,
-                    "keywords": entry.keywords,
-                    "timestamp": entry.timestamp or "",
-                    "location": entry.location or "",
-                    "persons": entry.persons,
-                    "entities": entry.entities,
-                    "topic": entry.topic or "",
-                },
+                metadata=self._entry_to_metadata(entry),
             )
             for entry, vector in zip(entries, vectors)
         ]
 
         self.backend.insert(records)
+        self._revision += 1
         print(f"Added {len(entries)} memory entries")
 
-    def semantic_search(self, query: str, top_k: int = 5) -> List[MemoryEntry]:
-        """Search the semantic retrieval path."""
+    def semantic_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[MemoryEntry]:
+        """Search the semantic retrieval path.
+
+        ``filters`` is applied as a backend prefilter so the top-k budget is
+        spent on visible entries only (MemWeaver's as-of retrieval).
+        """
         try:
             if self.backend.count() == 0:
                 return []
@@ -89,6 +119,31 @@ class VectorStore:
             results = self.backend.semantic_search(
                 query_vector.tolist(),
                 top_k=top_k,
+                filters=filters,
+            )
+            return self._results_to_entries(results)
+        except Exception as error:
+            print(f"Error during semantic search: {error}")
+            return []
+
+    def semantic_search_by_vector(
+        self,
+        query_vector: List[float],
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[MemoryEntry]:
+        """Search the semantic path with an already-computed vector.
+
+        Lets callers batch their embedding work (MemWeaver's finalize sweep
+        embeds every open fact in one pass).
+        """
+        try:
+            if self.backend.count() == 0:
+                return []
+            results = self.backend.semantic_search(
+                list(query_vector),
+                top_k=top_k,
+                filters=filters,
             )
             return self._results_to_entries(results)
         except Exception as error:
@@ -143,6 +198,35 @@ class VectorStore:
         """Get all memory entries."""
         return self._results_to_entries(self.backend.get_all())
 
+    def get_by_ids(self, entry_ids: List[str]) -> List[MemoryEntry]:
+        """Fetch entries by id, skipping ids that are not stored."""
+        if not entry_ids:
+            return []
+        return self._results_to_entries(self.backend.get_by_ids(entry_ids))
+
+    def update_metadata(self, entry_id: str, fields: Dict[str, Any]) -> None:
+        """Update metadata fields of a stored entry in place.
+
+        Used by MemWeaver's weaving execution (closing ``valid_until``, setting
+        ``superseded_by``, appending weave ``links``).
+        """
+        if not fields:
+            return
+
+        unknown = set(fields) - self.METADATA_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown metadata fields: {sorted(unknown)}")
+
+        self.backend.update_metadata(entry_id, fields)
+        self._revision += 1
+
+    def delete_by_ids(self, entry_ids: List[str]) -> None:
+        """Delete entries by id (summary/profile rewrite = delete + insert)."""
+        if not entry_ids:
+            return
+        self.backend.delete_by_ids(entry_ids)
+        self._revision += 1
+
     def optimize(self) -> None:
         """Optimize backend indexes after bulk insertions."""
         self.backend.optimize()
@@ -151,7 +235,28 @@ class VectorStore:
     def clear(self) -> None:
         """Clear all backend data."""
         self.backend.clear()
+        self._revision += 1
         print("Database cleared")
+
+    @staticmethod
+    def _entry_to_metadata(entry: MemoryEntry) -> Dict[str, Any]:
+        """Flatten an entry into backend-neutral metadata."""
+        return {
+            "lossless_restatement": entry.lossless_restatement,
+            "keywords": entry.keywords,
+            "timestamp": entry.timestamp or "",
+            "location": entry.location or "",
+            "persons": entry.persons,
+            "entities": entry.entities,
+            "topic": entry.topic or "",
+            "kind": entry.kind or KIND_FACT,
+            "thread_id": entry.thread_id or "",
+            "valid_from": entry.valid_from or "",
+            "valid_until": entry.valid_until or "",
+            "superseded_by": entry.superseded_by or "",
+            "links": entry.links,
+            "context_digest": entry.context_digest or "",
+        }
 
     @staticmethod
     def _results_to_entries(
@@ -171,6 +276,13 @@ class VectorStore:
                         persons=list(metadata.get("persons") or []),
                         entities=list(metadata.get("entities") or []),
                         topic=metadata.get("topic") or None,
+                        kind=metadata.get("kind") or KIND_FACT,
+                        thread_id=metadata.get("thread_id") or "",
+                        valid_from=metadata.get("valid_from") or "",
+                        valid_until=metadata.get("valid_until") or "",
+                        superseded_by=metadata.get("superseded_by") or "",
+                        links=list(metadata.get("links") or []),
+                        context_digest=metadata.get("context_digest") or "",
                     )
                 )
             except Exception as error:

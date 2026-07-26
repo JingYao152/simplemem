@@ -108,6 +108,43 @@ MAX_REFLECTION_ROUNDS = 2
 
 
 # ============================================================================
+# MemWeaver Configuration (docs/memweaver-design.md)
+# ============================================================================
+# Write-time self-organizing memory fabric. Zero tuning parameters: every
+# organization decision is an LLM semantic judgement with a deterministic
+# fallback. The switches below are ablation switches, one per row of the
+# ablation table - not knobs to tune.
+
+# Master switch: replaces the sliding-window write pipeline with the Call A/B
+# fabric pipeline and enables as-of validity filtering on the read side.
+# False = pure SimpleMem (the A/B baseline arm).
+ENABLE_MEMWEAVER = False
+
+# Typed weaving operations (supersede / refine / bridge). False keeps threads
+# and living summaries but writes no fabric edges and closes no fact.
+ENABLE_WEAVING = True
+
+# finalize() cross-thread supersede sweep, which catches knowledge updates that
+# thread assignment split across threads.
+ENABLE_SWEEP = True
+
+# P1: context-inheriting embeddings + semantically triggered re-embedding.
+ENABLE_RECONTEXT = False
+
+# P2: one-hop evidence expansion + cross-encoder rerank.
+ENABLE_EXPAND_RERANK = False
+
+# Temperature for every MemWeaver LLM call (thread assignment, thread update,
+# sweep judgement). Design doc section 6: one global value, and decision
+# variance is reported (3 runs, mean +/- std) rather than tuned away.
+LLM_TEMPERATURE = 0.7
+
+# NOTE: when MemWeaver is enabled, EvolveMem's time_decay_half_life_days soft
+# decay must stay disabled - as-of validity filtering replaces it (design doc
+# section 10.3).
+
+
+# ============================================================================
 # LLM-as-Judge Configuration (not used yet)
 # ============================================================================
 

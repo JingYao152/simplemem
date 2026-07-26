@@ -76,10 +76,15 @@ if [[ "$ABLATIONS" == "1" ]]; then
         --result-file "$OUT/mw_no_profiles.json" 2>&1 \
         | tee "$OUT/mw_no_profiles.log" | tail -40
 
-    echo "== ablation: no expansion / no rerank =="
-    python test_locomo10.py "${COMMON[@]}" --memweaver --no-expand-rerank \
-        --result-file "$OUT/mw_no_expand_rerank.json" 2>&1 \
-        | tee "$OUT/mw_no_expand_rerank.log" | tail -40
+    echo "== ablation: no expansion (C3 attribution, reranker kept) =="
+    python test_locomo10.py "${COMMON[@]}" --memweaver --no-expansion \
+        --result-file "$OUT/mw_no_expansion.json" 2>&1 \
+        | tee "$OUT/mw_no_expansion.log" | tail -40
+
+    echo "== ablation: no rerank (inherited component dropped) =="
+    python test_locomo10.py "${COMMON[@]}" --memweaver --no-rerank \
+        --result-file "$OUT/mw_no_rerank.json" 2>&1 \
+        | tee "$OUT/mw_no_rerank.log" | tail -40
 
     echo "== reference: pure SimpleMem (no reranker) =="
     python test_locomo10.py "${COMMON[@]}" --no-memweaver --no-expand-rerank \
@@ -93,7 +98,7 @@ python scripts/compare_locomo_results.py \
     | tee "$OUT/comparison.txt"
 
 if [[ "$ABLATIONS" == "1" ]]; then
-    for ablation in no_weaving no_sweep no_recontext no_profiles no_expand_rerank; do
+    for ablation in no_weaving no_sweep no_recontext no_profiles no_expansion no_rerank; do
         echo "== comparison: memweaver vs $ablation =="
         python scripts/compare_locomo_results.py \
             "$OUT"/memweaver_run*.json --memweaver "$OUT/mw_$ablation.json" \

@@ -51,6 +51,8 @@ class HybridRetriever:
         max_retrieval_workers: int = 3,
         enable_memweaver: Optional[bool] = None,
         enable_expand_rerank: Optional[bool] = None,
+        enable_expansion: Optional[bool] = None,
+        enable_rerank: Optional[bool] = None,
         reranker: Optional[CrossEncoderReranker] = None
     ):
         self.llm_client = llm_client
@@ -68,15 +70,29 @@ class HybridRetriever:
         )
         self._anchor_cache: Optional[tuple] = None
 
-        # P2: one-hop fabric expansion + cross-encoder flat rerank. Independent of
-        # enable_memweaver on purpose - the baseline arm is fitted with the same
-        # reranker for parity (design doc section 10), where expansion finds
-        # nothing because there are no fabric edges to walk.
-        self.enable_expand_rerank = (
+        # P2: one-hop fabric expansion and cross-encoder rerank are switched
+        # separately, because the design attributes them differently - expansion
+        # is contribution C3, the reranker is an inherited generic component that
+        # baseline parity requires on every compared system (design doc section
+        # 10). ENABLE_EXPAND_RERANK is the compound switch over both.
+        stage_enabled = (
             enable_expand_rerank
             if enable_expand_rerank is not None
             else getattr(config, 'ENABLE_EXPAND_RERANK', False)
         )
+        self.enable_expansion = stage_enabled and (
+            enable_expansion
+            if enable_expansion is not None
+            else getattr(config, 'ENABLE_EXPANSION', True)
+        )
+        self.enable_rerank = stage_enabled and (
+            enable_rerank
+            if enable_rerank is not None
+            else getattr(config, 'ENABLE_RERANK', True)
+        )
+        # Neither part of P2 is tied to enable_memweaver: on baseline data
+        # expansion simply finds no fabric edges to walk.
+        self.enable_expand_rerank = self.enable_expansion or self.enable_rerank
         self.reranker = reranker or CrossEncoderReranker()
 
         # Use config values as default if not explicitly provided
@@ -226,26 +242,33 @@ class HybridRetriever:
         walking a supersede chain is how history is recovered, so re-applying the
         validity filter here would undo the expansion.
         """
-        if not self.enable_expand_rerank or not candidates:
+        if not candidates:
             return candidates
 
-        pool = expand_one_hop(self.vector_store, candidates)
-        added = len(pool.entries) - len(candidates)
-        if added:
-            print(
-                f"[Expand] +{added} one-hop entries "
-                f"({', '.join(f'{edge}:{count}' for edge, count in sorted(pool.counts().items()))})"
-            )
+        provenance = {}
+        entries = candidates
+        if self.enable_expansion:
+            pool = expand_one_hop(self.vector_store, candidates)
+            entries, provenance = pool.entries, pool.provenance
+            added = len(entries) - len(candidates)
+            if added:
+                print(
+                    f"[Expand] +{added} one-hop entries "
+                    f"({', '.join(f'{edge}:{count}' for edge, count in sorted(pool.counts().items()))})"
+                )
+
+        if not self.enable_rerank:
+            return entries
 
         ranked, reranked = self.reranker.rerank(
             query,
-            pool.entries,
+            entries,
             to_text=lambda entry: scoring_text(
-                entry, pool.provenance.get(entry.entry_id)
+                entry, provenance.get(entry.entry_id)
             ),
         )
         print(
-            f"[Rerank] {len(pool.entries)} candidates -> {len(ranked)} contexts"
+            f"[Rerank] {len(entries)} candidates -> {len(ranked)} contexts"
             + ("" if reranked else " (model unavailable: retrieval order kept)")
         )
         return ranked

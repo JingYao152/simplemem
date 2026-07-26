@@ -152,6 +152,28 @@ P2 的三类边/一跳边界/provenance 打分/精排降级/链式排布）、
 
 ## 4. 消融开关
 
+### 4.0 阶段 ↔ 开关的对应关系（含两处不是 1:1 的地方）
+
+| 阶段 | 开关 | 能否单独关掉 |
+|---|---|---|
+| P0 写侧机制 | `ENABLE_MEMWEAVER`（总）、`ENABLE_WEAVING`、`ENABLE_SWEEP` | 编织与兜底扫描各自独立；P0 本身即总开关 |
+| P1 表示协同演化 | `ENABLE_RECONTEXT`、`ENABLE_ENTITY_PROFILES` | 两个机制各自独立 |
+| P2 读侧原语 | `ENABLE_EXPAND_RERANK`（总）、`ENABLE_EXPANSION`、`ENABLE_RERANK` | 扩展与精排各自独立 |
+
+两处**结构性**的不可分：
+
+1. **P1 依赖 P0**，不存在"关掉 P0、留着 P1"的配置：上下文继承嵌入的前缀来自活体
+   线程摘要，实体档案来自线程归属——没有写侧织物就没有这两样东西的输入。
+   `ENABLE_MEMWEAVER=False` 时 P1 的两个开关自然失效。
+2. **P2 不依赖 P0/P1**，可以单独开：基线数据上一跳扩展找不到织物边（空操作），
+   精排照常工作。这正是 parity 配置（见 4.2）。
+
+`ENABLE_EXPANSION` 与 `ENABLE_RERANK` 之所以必须分开：设计第 10 节把精排器标为
+**继承组件、不进贡献声明**，而一跳扩展是 **C3 声明的贡献**。两者共用一个开关就
+无法回答"增量来自 C3 还是来自那个通用精排器"——这是审稿人会问的第一个问题。
+
+### 4.1 开关清单
+
 `config.py`（或环境变量）中：
 
 | 开关 | 默认 | 状态 |
@@ -161,13 +183,27 @@ P2 的三类边/一跳边界/provenance 打分/精排降级/链式排布）、
 | `ENABLE_SWEEP` | `True` | P0：finalize 跨线程 supersede 扫描 |
 | `ENABLE_RECONTEXT` | `True` | P1：上下文继承嵌入 + `outdated_facts` 重嵌入。关掉 = 纯 SimpleMem 单句嵌入 |
 | `ENABLE_ENTITY_PROFILES` | `True` | P1：实体档案（`profile::<name>`）入池 |
-| `ENABLE_EXPAND_RERANK` | `True` | P2：一跳扩展 + 交叉编码器精排 + 链标注。**不**受 `ENABLE_MEMWEAVER` 约束（parity：基线 arm 也配同一精排器） |
+| `ENABLE_EXPAND_RERANK` | `True` | P2 阶段总开关（复合）：关掉则扩展与精排都不做 |
+| `ENABLE_EXPANSION` | `True` | P2 之一：一跳扩展 + supersede 链标注 = **贡献 C3**（论文声明的部分） |
+| `ENABLE_RERANK` | `True` | P2 之二：交叉编码器 = **继承组件、不进贡献声明**；parity 要求两个 arm 都开 |
 | `RERANK_TOP_K` | `20` | 精排后进入回答上下文的条目数（容量常数） |
 | `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | 本地交叉编码器；CPU 上可换 `bge-reranker-base` 降成本 |
 | `LLM_TEMPERATURE` | `0.7` | MemWeaver 全部 LLM 调用统一温度 |
 
 启用 MemWeaver 时必须禁用 EvolveMem 的 `time_decay_half_life_days`
 （设计第 10.3 节：时间机制互斥）。
+
+### 4.2 主表与 parity
+
+主表两个 arm 都开 `ENABLE_RERANK`（`ENABLE_EXPANSION` 在基线上是空操作）：
+
+| 配置 | 命令 | 用途 |
+|---|---|---|
+| 基线 + 精排 | `--no-memweaver` | 主表 arm A |
+| MemWeaver 全量 | `--memweaver` | 主表 arm B |
+| 纯 SimpleMem | `--no-memweaver --no-expand-rerank` | 论文里的"原版 SimpleMem"参照 |
+| C3 归因 | `--memweaver --no-expansion` | arm B 减去 C3 读侧原语，精排仍在 |
+| 精排贡献 | `--memweaver --no-rerank` | arm B 减去继承组件 |
 
 ## 5. 跑 A/B
 
@@ -191,7 +227,9 @@ python test_locomo10.py --memweaver --no-weaving   --result-file results/mw_no_w
 python test_locomo10.py --memweaver --no-sweep     --result-file results/mw_no_sweep.json
 python test_locomo10.py --memweaver --no-recontext --result-file results/mw_no_recontext.json
 python test_locomo10.py --memweaver --no-profiles  --result-file results/mw_no_profiles.json
-python test_locomo10.py --memweaver --no-expand-rerank --result-file results/mw_no_expand_rerank.json
+python test_locomo10.py --memweaver --no-expansion --result-file results/mw_no_expansion.json
+python test_locomo10.py --memweaver --no-rerank    --result-file results/mw_no_rerank.json
+python test_locomo10.py --memweaver --no-expand-rerank --result-file results/mw_no_p2.json
 
 # 对比（温度 0.7 → 每 arm 跑 3 次，脚本按 arm 聚合 mean±std）
 python scripts/compare_locomo_results.py \

@@ -1015,11 +1015,8 @@ Return ONLY the JSON, no other text.
         """Which A/B arm this run is: MemWeaver (with ablations) or baseline."""
         weaver = getattr(self.system, 'memweaver', None)
         if weaver is None:
-            reranked = getattr(
-                getattr(self.system, 'hybrid_retriever', None),
-                'enable_expand_rerank',
-                False,
-            )
+            retriever = getattr(self.system, 'hybrid_retriever', None)
+            reranked = getattr(retriever, 'enable_rerank', False)
             return 'simplemem-baseline' + (' (+rerank)' if reranked else '')
         flags = []
         if not weaver.enable_weaving:
@@ -1030,9 +1027,20 @@ Return ONLY the JSON, no other text.
             flags.append('no-recontext')
         if not weaver.enable_entity_profiles:
             flags.append('no-profiles')
-        if not self.system.hybrid_retriever.enable_expand_rerank:
-            flags.append('no-expand-rerank')
+        flags.extend(self._read_stage_flags())
         return 'memweaver' + (f" ({', '.join(flags)})" if flags else '')
+
+    def _read_stage_flags(self) -> List[str]:
+        """Which parts of the P2 read stage are off in this run."""
+        retriever = getattr(self.system, 'hybrid_retriever', None)
+        if retriever is None:
+            return []
+        if not retriever.enable_expand_rerank:
+            return ['no-expand-rerank']
+        return (
+            ([] if retriever.enable_expansion else ['no-expansion'])
+            + ([] if retriever.enable_rerank else ['no-rerank'])
+        )
 
     def run_test(self, num_samples: int = None, save_results: bool = True, result_file: str = 'locomo10_test_results.json', enable_parallel_questions: bool = False):
         """Run full test on dataset"""
@@ -1136,8 +1144,11 @@ Return ONLY the JSON, no other text.
                         'num_questions': len(all_results),
                         'arm': self.arm_name(),
                         'memweaver': bool(getattr(self.system, 'enable_memweaver', False)),
-                        'expand_rerank': bool(
-                            getattr(self.system.hybrid_retriever, 'enable_expand_rerank', False)
+                        'expansion': bool(
+                            getattr(self.system.hybrid_retriever, 'enable_expansion', False)
+                        ),
+                        'rerank': bool(
+                            getattr(self.system.hybrid_retriever, 'enable_rerank', False)
                         ),
                         'rerank_top_k': getattr(
                             self.system.hybrid_retriever.reranker, 'top_k', None
@@ -1195,10 +1206,15 @@ def main():
     parser.add_argument('--no-profiles', dest='profiles', action='store_false', default=None,
                        help='Ablation: do not write entity profiles into the pool')
     parser.add_argument('--no-expand-rerank', dest='expand_rerank', action='store_false', default=None,
-                       help='Ablation: no one-hop expansion and no cross-encoder rerank. '
+                       help='Ablation: turn the whole P2 read stage off (no expansion, '
+                            'no rerank). Use it for the pure-SimpleMem reference number.')
+    parser.add_argument('--no-expansion', dest='expansion', action='store_false', default=None,
+                       help='Ablation: keep the reranker but do not expand along fabric '
+                            'edges - isolates contribution C3 from the inherited reranker')
+    parser.add_argument('--no-rerank', dest='rerank', action='store_false', default=None,
+                       help='Ablation: keep expansion but drop the cross-encoder. '
                             'NOTE: for the main table keep the reranker on BOTH arms '
-                            '(baseline parity); use this for the ablation row and for '
-                            'the pure-SimpleMem reference number.')
+                            '(baseline parity, design doc section 10).')
 
     args = parser.parse_args()
 
@@ -1211,7 +1227,9 @@ def main():
         enable_sweep=args.sweep,
         enable_recontext=args.recontext,
         enable_entity_profiles=args.profiles,
-        enable_expand_rerank=args.expand_rerank
+        enable_expand_rerank=args.expand_rerank,
+        enable_expansion=args.expansion,
+        enable_rerank=args.rerank
     )
 
     # The ablations only mean something on the MemWeaver arm; say so loudly

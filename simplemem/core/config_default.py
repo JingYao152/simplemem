@@ -138,15 +138,24 @@ ENABLE_RECONTEXT = True
 # built by deterministic code from the threads a speaker takes part in.
 ENABLE_ENTITY_PROFILES = True
 
-# P2: one-hop fabric expansion + flat cross-encoder rerank.
-# Expansion walks supersede chains, weave edges and thread membership one hop out
-# from every retrieved fact; the reranker then scores the whole expanded pool.
-# NOTE ON PARITY (design doc section 10): the reranker is an inherited generic
-# component, and every compared system is fitted with it before comparison. Keep
-# this True on BOTH arms for the main table; expansion is a no-op on the baseline
-# because there are no fabric edges to walk. The pure-SimpleMem reference number
-# is --no-memweaver --no-expand-rerank.
+# P2 stage switch (compound): one-hop fabric expansion + flat cross-encoder
+# rerank + supersede-chain annotation. False turns the whole read-side stage off.
 ENABLE_EXPAND_RERANK = True
+
+# P2, part 1: one-hop expansion along the fabric's own edges, plus the
+# supersede-chain annotation that makes recovered history readable. This is
+# contribution C3 - the part the paper claims.
+ENABLE_EXPANSION = True
+
+# P2, part 2: the cross-encoder reranker. Design doc section 10 marks it an
+# INHERITED generic component that is explicitly NOT claimed, and requires every
+# compared system to be fitted with it before comparison.
+# For the main table keep it True on BOTH arms (expansion is a no-op on the
+# baseline, which has no fabric edges to walk). Switching expansion and rerank
+# separately is what lets the ablation table attribute the increment to C3 rather
+# than to the reranker. The pure-SimpleMem reference number is
+# --no-memweaver --no-expand-rerank.
+ENABLE_RERANK = True
 
 # Entries kept after reranking, i.e. the answer context size. The only capacity
 # constant MemWeaver adds (design doc section 7); fixed, not tuned.

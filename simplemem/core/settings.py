@@ -45,6 +45,8 @@ _DEFAULTS = {
     "ENABLE_RECONTEXT": True,
     "ENABLE_ENTITY_PROFILES": True,
     "ENABLE_EXPAND_RERANK": True,
+    "ENABLE_EXPANSION": True,
+    "ENABLE_RERANK": True,
     "RERANK_TOP_K": 20,
     "RERANKER_MODEL": "BAAI/bge-reranker-v2-m3",
     "LLM_TEMPERATURE": 0.7,

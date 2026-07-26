@@ -2147,3 +2147,97 @@ def test_cyclic_links_do_not_hang_the_layout():
     ordered = AnswerGenerator._order_supersede_chains(contexts)
 
     assert [entry.entry_id for entry in ordered] == ["x", "y"]
+
+
+# ----------------------------------------------------------------------
+# P2 - expansion and rerank switch independently
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "expansion, rerank, expect_expanded, expect_scored",
+    [
+        (True, True, True, True),      # full P2 stage
+        (True, False, True, False),    # C3 only: expansion without the reranker
+        (False, True, False, True),    # parity config: reranker without expansion
+        (False, False, False, False),  # stage off
+    ],
+)
+def test_expansion_and_rerank_are_independently_switchable(
+    store, expansion, rerank, expect_expanded, expect_scored
+):
+    _seed_fabric_neighbourhood(store)
+    reranker, encoder = _fake_reranker()
+    retriever = _retriever(
+        store,
+        semantic_top_k=10,
+        enable_expand_rerank=True,
+        enable_expansion=expansion,
+        enable_rerank=rerank,
+        reranker=reranker,
+    )
+
+    results = retriever.retrieve("Does Alice drink coffee?")
+    ids = {entry.entry_id for entry in results}
+
+    # "old" is only reachable through the supersede edge.
+    assert ("old" in ids) is expect_expanded
+    assert bool(encoder.pairs) is expect_scored
+    assert retriever.enable_expansion is expansion
+    assert retriever.enable_rerank is rerank
+
+
+def test_compound_switch_overrides_both_parts(store):
+    _seed_fabric_neighbourhood(store)
+    reranker, encoder = _fake_reranker()
+    retriever = _retriever(
+        store,
+        semantic_top_k=10,
+        enable_expand_rerank=False,
+        enable_expansion=True,
+        enable_rerank=True,
+        reranker=reranker,
+    )
+
+    results = retriever.retrieve("Does Alice drink coffee?")
+
+    assert retriever.enable_expansion is False
+    assert retriever.enable_rerank is False
+    assert encoder.pairs == []
+    assert "old" not in {entry.entry_id for entry in results}
+
+
+def test_rerank_only_still_applies_the_capacity_constant(store):
+    """The parity config keeps top_k, so context size matches the other arm."""
+    _seed_fabric_neighbourhood(store)
+    reranker, _ = _fake_reranker(top_k=2)
+    retriever = _retriever(
+        store,
+        semantic_top_k=10,
+        enable_expand_rerank=True,
+        enable_expansion=False,
+        enable_rerank=True,
+        reranker=reranker,
+    )
+
+    assert len(retriever.retrieve("Does Alice drink coffee?")) == 2
+
+
+def test_expansion_only_returns_the_whole_expanded_pool(store):
+    """Without the reranker there is no scoring stage to truncate the pool."""
+    _seed_fabric_neighbourhood(store)
+    reranker, encoder = _fake_reranker(top_k=2)
+    retriever = _retriever(
+        store,
+        semantic_top_k=10,
+        enable_expand_rerank=True,
+        enable_expansion=True,
+        enable_rerank=False,
+        reranker=reranker,
+    )
+
+    results = retriever.retrieve("Does Alice drink coffee?")
+
+    assert encoder.pairs == []
+    assert len(results) > 2
+    assert "old" in {entry.entry_id for entry in results}

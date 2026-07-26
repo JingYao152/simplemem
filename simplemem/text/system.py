@@ -50,7 +50,9 @@ class SimpleMemSystem:
         enable_sweep: Optional[bool] = None,
         enable_recontext: Optional[bool] = None,
         enable_entity_profiles: Optional[bool] = None,
-        enable_expand_rerank: Optional[bool] = None
+        enable_expand_rerank: Optional[bool] = None,
+        enable_expansion: Optional[bool] = None,
+        enable_rerank: Optional[bool] = None
     ):
         """
         Initialize system
@@ -76,7 +78,9 @@ class SimpleMemSystem:
         - enable_sweep: Enable the finalize cross-thread sweep (ablation switch, None=use config default)
         - enable_recontext: Enable context-inheriting embeddings + re-embedding (ablation switch, None=use config default)
         - enable_entity_profiles: Enable entity profiles in the pool (ablation switch, None=use config default)
-        - enable_expand_rerank: Enable one-hop expansion + cross-encoder rerank (ablation switch, None=use config default)
+        - enable_expand_rerank: Enable the whole P2 read stage (compound ablation switch, None=use config default)
+        - enable_expansion: Enable one-hop fabric expansion + chain annotation (C3 ablation switch, None=use config default)
+        - enable_rerank: Enable the cross-encoder reranker (inherited component; keep on for both A/B arms)
         """
         print("=" * 60)
         print("Initializing SimpleMem System")
@@ -147,19 +151,24 @@ class SimpleMemSystem:
             enable_parallel_retrieval=enable_parallel_retrieval,
             max_retrieval_workers=max_retrieval_workers,
             enable_memweaver=self.enable_memweaver,
-            enable_expand_rerank=enable_expand_rerank
+            enable_expand_rerank=enable_expand_rerank,
+            enable_expansion=enable_expansion,
+            enable_rerank=enable_rerank
         )
 
-        # The supersede-chain annotation belongs to the same read-side stage as
-        # expansion + rerank, so it follows that switch.
+        # The supersede-chain annotation is what makes expansion-recovered history
+        # readable, so it follows the expansion switch (C3) rather than the
+        # inherited reranker.
         self.answer_generator = AnswerGenerator(
             llm_client=self.llm_client,
-            annotate_chains=self.hybrid_retriever.enable_expand_rerank
+            annotate_chains=self.hybrid_retriever.enable_expansion
         )
         if self.hybrid_retriever.enable_expand_rerank:
             print(
-                "One-hop expansion + rerank enabled "
-                f"(model={self.hybrid_retriever.reranker.model_name}, "
+                "P2 read stage enabled "
+                f"(expansion={self.hybrid_retriever.enable_expansion}, "
+                f"rerank={self.hybrid_retriever.enable_rerank}, "
+                f"model={self.hybrid_retriever.reranker.model_name}, "
                 f"top_k={self.hybrid_retriever.reranker.top_k})"
             )
 
@@ -281,7 +290,9 @@ def create_system(
     enable_sweep: Optional[bool] = None,
     enable_recontext: Optional[bool] = None,
     enable_entity_profiles: Optional[bool] = None,
-    enable_expand_rerank: Optional[bool] = None
+    enable_expand_rerank: Optional[bool] = None,
+    enable_expansion: Optional[bool] = None,
+    enable_rerank: Optional[bool] = None
 ) -> SimpleMemSystem:
     """
     Create SimpleMem system instance (uses config.py defaults when None)
@@ -300,7 +311,9 @@ def create_system(
         enable_sweep=enable_sweep,
         enable_recontext=enable_recontext,
         enable_entity_profiles=enable_entity_profiles,
-        enable_expand_rerank=enable_expand_rerank
+        enable_expand_rerank=enable_expand_rerank,
+        enable_expansion=enable_expansion,
+        enable_rerank=enable_rerank
     )
 
 

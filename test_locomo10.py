@@ -10,6 +10,7 @@ rate directly from each QA's ``evidence`` field, which is available per question
 without waiting for end-to-end scores.
 """
 from pathlib import Path
+import threading
 import time
 import json
 from typing import List, Dict, Optional, Union
@@ -302,10 +303,42 @@ def calculate_bleu_scores(prediction: str, reference: str) -> Dict[str, float]:
 
     return scores
 
+# bert_score.score() builds its model on every call, so scoring N questions loads
+# roberta-large N times. A cached BERTScorer with the same configuration
+# (lang='en', default layers, no idf, no baseline rescaling) returns identical
+# numbers while loading once.
+_bert_scorer = None
+_bert_scorer_lock = threading.Lock()
+_bert_scorer_failed = False
+
+
+def _get_bert_scorer():
+    """Return a process-wide BERTScorer, or None to fall back to bert_score()."""
+    global _bert_scorer, _bert_scorer_failed
+
+    if _bert_scorer is not None or _bert_scorer_failed:
+        return _bert_scorer
+
+    with _bert_scorer_lock:
+        if _bert_scorer is None and not _bert_scorer_failed:
+            try:
+                from bert_score import BERTScorer
+                _bert_scorer = BERTScorer(lang='en', rescale_with_baseline=False)
+            except Exception as e:
+                print(f"Note: reusable BERTScorer unavailable ({e}); "
+                      "falling back to per-call scoring")
+                _bert_scorer_failed = True
+    return _bert_scorer
+
+
 def calculate_bert_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate BERTScore for semantic similarity."""
     try:
-        P, R, F1 = bert_score([prediction], [reference], lang='en', verbose=False)
+        scorer = _get_bert_scorer()
+        if scorer is not None:
+            P, R, F1 = scorer.score([prediction], [reference])
+        else:
+            P, R, F1 = bert_score([prediction], [reference], lang='en', verbose=False)
         return {
             'bert_precision': P.item(),
             'bert_recall': R.item(),

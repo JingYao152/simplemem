@@ -194,7 +194,29 @@ ENABLE_BUNDLE_RERANK / ENABLE_SUFFICIENCY_GATE。
      可对单次决策做 3 采样多数投票（成本 ×3，仅在审计发现不稳定时启用）；
   4. 解析失败 → 每个决策点有确定性兜底，兜底率入日志。
 
-## 10. LongMemEval 适配备注（暂缓，规则已定）
+## 10. 与 EvolveMem 的关系（机制/策略分层）
+
+代码层面无冲突：MemWeaver 全部实现于 `simplemem/core/`，EvolveMem
+（`simplemem/evolver/`）有独立的 retriever/store/benchmark runner，
+不共享检索代码。语义层面的主从关系定义如下：
+
+1. **机制 vs 策略**：MemWeaver 定义机制（fusion 固定 RRF、structured
+   日期窗口有界、person 过滤禁用），这些维度从 EvolveMem 的动作空间
+   （`RetrievalConfig`）中移除；进化循环的新动作空间是 MemWeaver 的
+   消融开关与 prompt 变体（ENABLE_SWEEP、门控上限、Call B 措辞等）——
+   EvolveMem 进化策略，不再调检索数值。
+2. **问题类型分类只留一套**：部署/评测路径用核心的表面形式分类器；
+   EvolveMem 的 gold-category 旗标 prompt 仅作为其进化循环内部工具，
+   不进核心管线。
+3. **时间机制互斥（硬性规定）**：as-of 有效期过滤取代
+   `time_decay_half_life_days` 软衰减。time_decay 是无事实生命周期时
+   对 knowledge-update 的启发式补偿，与 supersede 同开会双重惩罚旧事实，
+   且在 when 类问题上与"不过滤"策略直接冲突。MemWeaver 启用时
+   time_decay 必须禁用。
+4. **实验归因**：MemWeaver 主表与消融在纯 core 管线上跑（evolver 不参与）；
+   "EvolveMem 外环进化 MemWeaver 策略"留作扩展实验。
+
+## 11. LongMemEval 适配备注（暂缓，规则已定）
 
 - anchor 改用数据自带 question_date；`_abs` 弃答题由充分性门控天然处理；
 - `_m`（~500 session）规模下线程摘要全量入 prompt 会爆预算 → 启用嵌入预筛

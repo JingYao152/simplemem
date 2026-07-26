@@ -2223,8 +2223,12 @@ def test_rerank_only_still_applies_the_capacity_constant(store):
     assert len(retriever.retrieve("Does Alice drink coffee?")) == 2
 
 
-def test_expansion_only_returns_the_whole_expanded_pool(store):
-    """Without the reranker there is no scoring stage to truncate the pool."""
+def test_expansion_only_keeps_the_capacity_constant(store):
+    """Ablating the cross-encoder must not also change the context size.
+
+    Otherwise the --no-rerank row compares "no ranking" against "20 contexts vs
+    the whole pool" and attributes the difference to the reranker.
+    """
     _seed_fabric_neighbourhood(store)
     reranker, encoder = _fake_reranker(top_k=2)
     retriever = _retriever(
@@ -2238,6 +2242,22 @@ def test_expansion_only_returns_the_whole_expanded_pool(store):
 
     results = retriever.retrieve("Does Alice drink coffee?")
 
+    assert encoder.pairs == [], "no cross-encoder was consulted"
+    assert len(results) == 2, "retrieval order, truncated to top_k"
+
+
+def test_whole_stage_off_keeps_the_native_simplemem_pool(store):
+    """--no-expand-rerank is the baseline read path: no top-k stage at all."""
+    _seed_fabric_neighbourhood(store)
+    reranker, encoder = _fake_reranker(top_k=2)
+    retriever = _retriever(
+        store,
+        semantic_top_k=10,
+        enable_expand_rerank=False,
+        reranker=reranker,
+    )
+
+    results = retriever.retrieve("Does Alice drink coffee?")
+
     assert encoder.pairs == []
-    assert len(results) > 2
-    assert "old" in {entry.entry_id for entry in results}
+    assert len(results) > 2, "the base pool is handed over untouched"

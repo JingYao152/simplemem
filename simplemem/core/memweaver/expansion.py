@@ -36,7 +36,8 @@ from simplemem.core.models.memory_entry import (
 )
 
 
-#: Edge labels used in provenance (and in the reranker's scoring prefix).
+#: Edge labels used in provenance (and in the reranker's scoring prefix). The
+#: weave labels are the stored edge types, so they double as lookup keys.
 EDGE_SUPERSEDED_BY = "superseded by"
 EDGE_SUPERSEDES = "supersedes"
 EDGE_REFINE = WEAVE_REFINE
@@ -120,7 +121,7 @@ def expand_one_hop(
     # (2) weave edges: written on both endpoints at weave time.
     weave_targets: Dict[str, List[Tuple[str, MemoryEntry]]] = {}
     for anchor in anchors:
-        for edge_type in (WEAVE_REFINE, WEAVE_BRIDGE):
+        for edge_type in (EDGE_REFINE, EDGE_BRIDGE):
             for target_id in anchor.weave_targets(edge_type):
                 weave_targets.setdefault(target_id, []).append((edge_type, anchor))
     for entry in _fetch_by_ids(vector_store, list(weave_targets)):

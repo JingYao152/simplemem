@@ -39,10 +39,13 @@
 | 系统装配（写路由 + finalize） | `main.py` |
 | 评测：A/B 同 harness + evidence 检索命中率 | `test_locomo10.py`、`locomo_evidence.py` |
 
-单元测试：`tests/test_memweaver.py`（91 例，全部 LLM 调用脚本化与交叉编码器
-桩化，覆盖每个决策点的确定性兜底、P1 的前缀不落库/指纹幂等/档案重写、
-P2 的三类边/一跳边界/provenance 打分/精排降级/链式排布）、
-`tests/test_evidence_retrieval.py`（12 例）。
+单元测试 120 例（`python -m pytest tests/ --ignore=tests/test_vector_store.py`）：
+`tests/test_memweaver.py` 100 例（全部 LLM 调用脚本化、交叉编码器桩化，覆盖每个
+决策点的确定性兜底、P1 的前缀不落库/指纹幂等/档案重写、P2 的三类边/一跳边界/
+provenance 打分/精排降级/链式排布/四种开关组合）、
+`tests/test_evidence_retrieval.py` 12 例、`tests/test_vector_store_backend.py` 8 例。
+（`tests/test_vector_store.py` 是改动前就存在的脚本式文件，pytest 收集会报 8 个
+error，与本分支无关。）
 
 ## 2. 参数账本
 
@@ -204,6 +207,11 @@ P2 的三类边/一跳边界/provenance 打分/精排降级/链式排布）、
 | 纯 SimpleMem | `--no-memweaver --no-expand-rerank` | 论文里的"原版 SimpleMem"参照 |
 | C3 归因 | `--memweaver --no-expansion` | arm B 减去 C3 读侧原语，精排仍在 |
 | 精排贡献 | `--memweaver --no-rerank` | arm B 减去继承组件 |
+
+`--no-rerank` 仍然按检索顺序截断到 `RERANK_TOP_K`（与"模型加载不到"的降级路径
+一致）。否则这一行会同时改变"有没有排序"和"回答上下文有多大"（实测 20 → 51 条），
+把上下文膨胀的效果算到精排器头上。只有整个 P2 阶段关掉（`--no-expand-rerank`）
+才不截断——那一行就是原版 SimpleMem 的读路径，它本来没有 top-k 环节。
 
 ## 5. 跑 A/B
 

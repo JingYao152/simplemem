@@ -258,6 +258,17 @@ class HybridRetriever:
                 )
 
         if not self.enable_rerank:
+            if self.enable_expansion:
+                # The stage is on with the cross-encoder ablated away. Keep the
+                # capacity constant in retrieval order - exactly what the
+                # model-unavailable fallback does - so the row isolates ranking
+                # quality instead of also changing the answer context size.
+                limit = self.reranker.top_k
+                if len(entries) > limit:
+                    print(f"[Rerank] disabled: keeping the first {limit} by retrieval order")
+                return entries[:limit]
+            # Whole P2 stage off: the native SimpleMem read path, which has no
+            # top-k stage at all.
             return entries
 
         ranked, reranked = self.reranker.rerank(

@@ -113,29 +113,33 @@ finalize():
 
 ## 5. 读取管线
 
+设计原则：**检索基座 = SimpleMem 原生（与 baseline 完全共享、原样不动）；
+MemWeaver 只叠加织物衍生原语（C3）+ 一个通用重排组件**。RRF 融合、符号路
+改造、题型格式化 prompt、充分性门控均不纳入（属 EvolveMem 已声称成果或
+既有文献族；后续读侧如有新想法再议——候选清单见文末）。
+
 ```text
 anchor = 记忆库最大 session 日期        // LoCoMo 无 question_date → 结构规则
-qtype  = 表面形式分类（when 类 / 计数 / yes-no / either-or / 多项 / 默认）
 
-三路检索（沿用现有多查询规划）:
-  语义:  SEMANTIC_TOP_K=25；池含 fact + thread_summary + entity_profile 三粒度
-         非 when 类问题加 as-of 过滤: valid_until == "" OR valid_until >= anchor
-         when 类问题不过滤（问历史需要旧事实）
-  词法:  BM25，KEYWORD_TOP_K=5
-  符号:  仅时间/实体条件，返回日期窗口内全量（结构有界，无 top-k）
-         person 过滤禁用 ← 2 人对话上是退化操作（几乎全库命中）
+检索基座（SimpleMem 原生 hybrid_retriever，未改动）:
+  多查询规划 + 语义/词法/符号三路 + 去重合并    // SimpleMem 论文 3.3 节原生架构
+  唯一叠加: 语义路池含 fact + thread_summary + entity_profile 三粒度，
+            且非 when 类问题加 as-of 过滤:
+              valid_until == "" OR valid_until >= anchor      ← C3 织物衍生
+            when 类问题不过滤（问历史需要旧事实）
 
-→ RRF 融合（RRF_K=60；截断 CONTEXT_TOP_K=30）
 → 束扩展: 每个 fact 候选 + 其线程摘要 + links/superseded_by 完整一跳闭包
-          （evidence 实测均值 1.42 → 链接度数结构性低，无截断参数）
-→ [P2] 交叉编码器束重排（BAAI/bge-reranker-v2-m3，本地推理）
-→ 充分性门控喂入: 按重排分逐批喂给 LLM，判"证据已足够"即停（硬上限 12 束）
-   同时是 cat5 对抗题的弃答依据: 门控判不充分 → 允许 "Not mentioned"
-
-生成: 题型感知格式化（计数拼写形式 / 人类可读日期 / 裸 Yes-No / 选项文本 /
-      多项逗号列表）；temporal 题渲染 supersede 链:
-      "[SUPERSEDED on <d> by Context N]"（时间题常问"之前是什么"）
+          （evidence 实测均值 1.42 → 链接度数结构性低，无截断参数）← C3 织物衍生
+→ 交叉编码器束重排（BAAI/bge-reranker-v2-m3，本地推理）取 RERANK_TOP_K=10
+          ← 唯一保留的通用读侧组件（继承标注，不进贡献声明）
+→ 生成: SimpleMem 原生回答 prompt（不加题型格式化）；
+        temporal 题渲染 supersede 链:
+        "[SUPERSEDED on <d> by Context N]"（时间题常问"之前是什么"）← C3
 ```
+
+暂缓的读侧候选（后续有新想法再议）：RRF 融合、符号路日期窗口化与
+person 过滤禁用、题型格式化 prompt、充分性门控（cat5 由评测 harness
+现有的对抗 MCQ 流程兜底）。
 
 ## 6. LLM 决策点清单（替代超参数的全部位置）
 
@@ -145,41 +149,41 @@ qtype  = 表面形式分类（when 类 / 计数 / yes-no / either-or / 多项 / 
 | 摘要是否需要重写 | Call B summary_impact | SUMMARY_REWRITE_MIN_NEW_FACTS | 不重写 |
 | 哪些旧事实过期需重上下文化 | Call B outdated_facts | RECONTEXT_DRIFT_THRESHOLD | 不重嵌 |
 | 新旧事实的编织关系 | Call B weave | WEAVE_CANDIDATE_TOP_K（候选=同线程全量） | op=none |
-| 检索何时停止 | 充分性门控 | RERANK_TOP_K（调优义务 → 硬上限） | 喂满上限 |
 
 全部 LLM 调用统一 temperature=0.7（config 项 `LLM_TEMPERATURE`，全局生效）；
 每类兜底触发率记录为系统健康指标。
 
 ## 7. 参数账本
 
-**调优参数：0 个。** 容量常数 5 个（全部 fixed、不调优）：
+**调优参数：0 个。** MemWeaver 新增容量常数仅 1 个（fixed、不调优）：
 
 | 常数 | 值 | 性质 |
 |---|---|---|
-| RRF_K | 60 | 文献标准值 |
-| SEMANTIC_TOP_K | 25 | 容量（约为单对话记忆库的 ~10%） |
-| KEYWORD_TOP_K | 5 | 容量 |
-| CONTEXT_TOP_K | 30 | 容量 |
-| 门控硬上限 | 12 束 | 安全上限，非调优目标 |
+| RERANK_TOP_K | 10 | 重排后进入回答的束数，容量常数 |
+
+检索基座沿用 SimpleMem 原生配置（SEMANTIC_TOP_K=25 / KEYWORD_TOP_K=5 /
+STRUCTURED_TOP_K=5 / MAX_REFLECTION_ROUNDS=2），与 baseline 逐项相同，
+作为对照控制变量不动。
 
 被数据结构消灭的参数：THREAD_FLUSH_SIZE（session 边界）、线程候选池预筛
 （线程数结构有界）、WEAVE_CANDIDATE_TOP_K（同线程全量）、BUNDLE_MAX_NEIGHBORS
-（一跳闭包）、STRUCTURED_TOP_K（日期窗口有界）。
+（一跳闭包）。被移出方案的参数（随组件暂缓）：RRF_K、CONTEXT_TOP_K、
+门控硬上限、符号路窗口化相关规则。
 
 ## 8. 阶段划分与 LoCoMo 验证映射
 
 | 阶段 | 内容 | 主要受益类别（实测题数） |
 |---|---|---|
-| P0 | 数据模型 + 后端三能力 + Call A/B 写管线 + supersede + as-of 检索 + 兜底扫描 | cat2 时间题(321)、cat5 对抗(446，经门控) |
+| P0 | 数据模型 + 后端三能力 + Call A/B 写管线 + supersede + as-of 检索 + 兜底扫描 | cat2 时间题(321) |
 | P1 | 上下文继承嵌入 + outdated_facts 重嵌入 + 实体档案入池 | cat1 单跳(282)、cat4 开放域(841) |
-| P2 | RRF + 束扩展 + 交叉编码器重排 + 充分性门控 | cat3 多跳(96) + 全局 |
+| P2 | 束扩展 + 交叉编码器束重排 | cat3 多跳(96) + 全局 |
 
 验证方法：每阶段同 harness A/B（test_locomo10.py）；另用 QA 的 evidence 字段
 直接量**检索命中率**（session/dia_id 级），不必等端到端分数。
 
 消融开关（config，每项对应论文消融表一行）：
 ENABLE_MEMWEAVER / ENABLE_WEAVING / ENABLE_SWEEP / ENABLE_RECONTEXT /
-ENABLE_BUNDLE_RERANK / ENABLE_SUFFICIENCY_GATE。
+ENABLE_BUNDLE_RERANK。
 
 ## 9. 成本与风险
 
@@ -200,14 +204,15 @@ ENABLE_BUNDLE_RERANK / ENABLE_SUFFICIENCY_GATE。
 （`simplemem/evolver/`）有独立的 retriever/store/benchmark runner，
 不共享检索代码。语义层面的主从关系定义如下：
 
-1. **机制 vs 策略**：MemWeaver 定义机制（fusion 固定 RRF、structured
-   日期窗口有界、person 过滤禁用），这些维度从 EvolveMem 的动作空间
-   （`RetrievalConfig`）中移除；进化循环的新动作空间是 MemWeaver 的
-   消融开关与 prompt 变体（ENABLE_SWEEP、门控上限、Call B 措辞等）——
-   EvolveMem 进化策略，不再调检索数值。
-2. **问题类型分类只留一套**：部署/评测路径用核心的表面形式分类器；
-   EvolveMem 的 gold-category 旗标 prompt 仅作为其进化循环内部工具，
-   不进核心管线。
+1. **机制 vs 策略**：MemWeaver 定义写侧机制（线程/编织/有效期）与织物
+   衍生读取原语；检索基座保持 SimpleMem 原生，EvolveMem 的检索数值
+   动作空间不受影响。若将来进化循环作用于 MemWeaver，其动作空间是
+   MemWeaver 的消融开关与 Call A/B prompt 变体——EvolveMem 进化策略，
+   不触碰织物机制本身。
+2. **问题类型处理**：MemWeaver 不引入题型格式化 prompt（EvolveMem
+   已声称的成果）；读侧仅存的题型判断是"when 类问题跳过 as-of 过滤"
+   这一条结构规则。EvolveMem 的 gold-category 旗标 prompt 仅作为其
+   进化循环内部工具，不进核心管线。
 3. **时间机制互斥（硬性规定）**：as-of 有效期过滤取代
    `time_decay_half_life_days` 软衰减。time_decay 是无事实生命周期时
    对 knowledge-update 的启发式补偿，与 supersede 同开会双重惩罚旧事实，
@@ -216,20 +221,23 @@ ENABLE_BUNDLE_RERANK / ENABLE_SUFFICIENCY_GATE。
 4. **实验归因**：MemWeaver 主表与消融在纯 core 管线上跑（evolver 不参与）；
    "EvolveMem 外环进化 MemWeaver 策略"留作扩展实验。
 
-**创新性边界（论文贡献声明的画法）**：读取管线中的三路检索、RRF 融合、
-题型格式化 prompt 均为 EvolveMem 已声称的成果（充分性门控思想亦有
-adaptive-retrieval 文献族），一律**不进贡献声明**，标注为继承组件并引用。
-声称的贡献严格限于：C1 写时自组织织物（线程/活体摘要/类型化编织）、
-C2 组织⇄表示协同演化（上下文继承嵌入 + 语义触发重嵌入）、C3 织物衍生
-的读取原语（as-of 时点检索与证据束——强调其存在依赖织物结构：无
-valid_until 即无 as-of，无 weave 边即无束）。时间锚本身不新，新的是锚
-作用于写时编织产生的有效期而非分数软衰减。
-**Baseline parity 纪律**：所有对照系统配备同一套非创新读侧组件
-（RRF + 题型 prompt + 门控）后再比较，使主表增量只能归因于 C1–C3。
+**创新性边界（论文贡献声明的画法）**：RRF 融合、题型格式化 prompt、
+充分性门控等 EvolveMem 已声称/文献已有的读侧方法**已整体移出方案**
+（见第 5 节暂缓清单），从根源上消除撞车。系统内唯一保留的通用读侧
+组件是交叉编码器重排器，标注为继承组件、不进贡献声明。声称的贡献
+严格限于：C1 写时自组织织物（线程/活体摘要/类型化编织）、C2 组织⇄
+表示协同演化（上下文继承嵌入 + 语义触发重嵌入）、C3 织物衍生的读取
+原语（as-of 时点检索与证据束——强调其存在依赖织物结构：无
+valid_until 即无 as-of，无 weave 边即无束）。时间锚本身不新，新的是
+锚作用于写时编织产生的有效期而非分数软衰减。
+**Baseline parity 纪律**：所有对照系统配备同一个重排器（唯一的通用
+读侧组件）后再比较，检索基座与回答 prompt 均为 SimpleMem 原生且各系统
+一致，使主表增量只能归因于 C1–C3。
 
 ## 11. LongMemEval 适配备注（暂缓，规则已定）
 
-- anchor 改用数据自带 question_date；`_abs` 弃答题由充分性门控天然处理；
+- anchor 改用数据自带 question_date；`_abs` 弃答题需要弃答机制——届时
+  重新评估充分性门控（现已移出方案）或等读侧新想法；
 - `_m`（~500 session）规模下线程摘要全量入 prompt 会爆预算 → 启用嵌入预筛
   （scaling rule：摘要总量超 prompt 预算才启用，预筛量为容量常数）；
 - 跨线程兜底扫描在 knowledge-update 上从"保险"升级为"必要组件"。

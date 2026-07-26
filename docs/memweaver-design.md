@@ -58,7 +58,7 @@ Session 边界由数据自带（Dialogue.timestamp 变化即切换）。实测�
 ```text
 对每个 session S（日期 d，解析为 ISO）:
 
-  ── Call A: 线程分配（1 次 LLM 调用，temperature=0）──
+  ── Call A: 线程分配（1 次 LLM 调用，temperature=0.7）──
   输入:  S 的全部对话轮（编号 1..n）
          + 全部现存线程的一行摘要（实测线程数量级 20–60，全量入 prompt 可行；
            无休眠机制、无预筛参数）
@@ -135,7 +135,8 @@ qtype  = 表面形式分类（when 类 / 计数 / yes-no / either-or / 多项 / 
 | 新旧事实的编织关系 | Call B weave | WEAVE_CANDIDATE_TOP_K（候选=同线程全量） | op=none |
 | 检索何时停止 | 充分性门控 | RERANK_TOP_K（调优义务 → 硬上限） | 喂满上限 |
 
-全部决策调用 temperature=0；每类兜底触发率记录为系统健康指标。
+全部 LLM 调用统一 temperature=0.7（config 项 `LLM_TEMPERATURE`，全局生效）；
+每类兜底触发率记录为系统健康指标。
 
 ## 7. 参数账本
 
@@ -176,7 +177,9 @@ ENABLE_BUNDLE_RERANK / ENABLE_SUFFICIENCY_GATE。
 - **风险与对策**：
   1. Call A 分配质量是全楼地基 → 实现后先在 1–2 个样本上人工审计线程划分；
   2. 跨线程 supersede 漏检 → 兜底扫描独立消融开关，单独量化贡献；
-  3. LLM 决策随机性 → temperature=0 + 报 3 次运行方差；
+  3. LLM 决策随机性 → temperature=0.7 下决策方差高于贪心解码：必须报 3 次
+     运行的均值±方差；线程分配 / supersede 等结构性决策若观察到不稳定，
+     可对单次决策做 3 采样多数投票（成本 ×3，仅在审计发现不稳定时启用）；
   4. 解析失败 → 每个决策点有确定性兜底，兜底率入日志。
 
 ## 10. LongMemEval 适配备注（暂缓，规则已定）

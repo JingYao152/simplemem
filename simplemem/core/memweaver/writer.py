@@ -192,6 +192,7 @@ class MemWeaver:
             "recontext_reembedded": 0,
             "recontext_up_to_date": 0,
             "profiles_written": 0,
+            "profiles_unchanged": 0,
             "sweep_pairs_judged": 0,
             "sweep_supersedes": 0,
             "sweep_unordered_pairs": 0,
@@ -848,7 +849,8 @@ class MemWeaver:
         targets: List[MemoryEntry] = []
         texts: List[str] = []
 
-        for index in update.outdated_facts:
+        # A repeated candidate number must not be re-embedded (or counted) twice.
+        for index in dict.fromkeys(update.outdated_facts):
             fact = candidates[index - 1]
             if fact.context_digest == digest:
                 self._bump("recontext_up_to_date")
@@ -915,14 +917,18 @@ class MemWeaver:
             )
             if not threads:
                 continue
+            entry = build_entity_profile_entry(
+                name, threads, session_date, session_datetime
+            )
             existing = snapshot.profiles.get(name)
             if existing is not None:
+                if existing.lossless_restatement == entry.lossless_restatement:
+                    # Nothing this speaker takes part in changed: rewriting the
+                    # row would only re-embed identical text.
+                    self._bump("profiles_unchanged")
+                    continue
                 stale_ids.append(existing.entry_id)
-            profile_entries.append(
-                build_entity_profile_entry(
-                    name, threads, session_date, session_datetime
-                )
-            )
+            profile_entries.append(entry)
 
         if stale_ids:
             self.vector_store.delete_by_ids(stale_ids)

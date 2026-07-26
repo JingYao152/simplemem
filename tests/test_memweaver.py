@@ -1634,3 +1634,113 @@ def test_speaker_threads_orders_by_recency():
     # A thread the speaker just spoke in counts even before its facts name them.
     with_extra = speaker_threads(threads, facts_by_thread, "Melanie", ["t2"])
     assert [state.thread_id for state in with_extra] == ["t2", "t3", "t1"]
+
+
+# ----------------------------------------------------------------------
+# P1 review fixes
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "summary, expected",
+    [
+        # Abbreviations must not be read as sentence ends.
+        ("Melanie moved to St. Louis and paints there.",
+         "Melanie moved to St. Louis and paints there."),
+        ("Nate served in the U.S. Army before teaching.",
+         "Nate served in the U.S. Army before teaching."),
+        ("Dr. Kim treats Caroline's knee.", "Dr. Kim treats Caroline's knee."),
+        # Real sentence boundaries still cut.
+        ("Melanie paints watercolours. She sells them now.",
+         "Melanie paints watercolours."),
+        ("Does Caroline still run? She stopped in May.", "Does Caroline still run?"),
+        ("Melanie won! She was thrilled.", "Melanie won!"),
+        # A trailing period is not a boundary to cut at.
+        ("Melanie paints watercolours.", "Melanie paints watercolours."),
+    ],
+)
+def test_context_prefix_survives_abbreviations(summary, expected):
+    assert context_prefix(summary) == expected
+
+
+def test_repeated_outdated_indices_are_reembedded_once(recording_store):
+    llm = ScriptedLLM(
+        assignment=[
+            assignment(([1], "new:Painting hobby")),
+            assignment(([1], "existing:t1")),
+        ],
+        thread_update=[
+            thread_update([fact("Melanie bought watercolor brushes.")],
+                          summary="Melanie is starting to paint."),
+            thread_update([fact("Melanie sold a painting.")],
+                          summary="Melanie sells her watercolour paintings now.",
+                          outdated=[1, 1, 1]),
+        ],
+    )
+    weaver = build_weaver(recording_store, llm)
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "brushes"))
+    weaver.add_dialogues(turns("1:00 pm on 8 June, 2023", "sold", start=2))
+    weaver.process_remaining()
+
+    assert weaver.stats["recontext_reembedded"] == 1
+    assert weaver.stats["recontext_up_to_date"] == 0
+
+
+def test_profile_text_carries_no_internal_thread_ids(store):
+    llm = _profile_llm()
+    weaver = build_weaver(store, llm)
+
+    weaver.add_dialogues(
+        [
+            Dialogue(dialogue_id=1, speaker="Melanie", content="I paint",
+                     timestamp="1:00 pm on 1 May, 2023"),
+            Dialogue(dialogue_id=2, speaker="Caroline", content="nice",
+                     timestamp="1:00 pm on 1 May, 2023"),
+        ]
+    )
+    weaver.process_remaining()
+
+    profile = store.get_by_ids([MemoryEntry.entity_profile_id("Melanie")])[0]
+    assert "Painting hobby" in profile.lossless_restatement
+    assert "[t1]" not in profile.lossless_restatement
+    # Call A still needs the id in its catalogue.
+    assert load_fabric(store).threads["t1"].one_line().startswith("[t1] ")
+
+
+def test_unchanged_profile_is_not_rewritten(store):
+    """A speaker whose threads did not change costs no profile re-embedding."""
+    llm = ScriptedLLM(
+        assignment=[
+            assignment(([1], "new:Painting hobby")),
+            assignment(([1], "existing:t1")),
+        ],
+        thread_update=[
+            thread_update([fact("Melanie paints.", persons=["Melanie"])],
+                          summary="Melanie paints watercolours."),
+            # Second session changes nothing about the thread summary.
+            thread_update([fact("Melanie mentioned paint prices.", persons=["Melanie"])],
+                          summary="ignored",
+                          impact="none"),
+        ],
+    )
+    weaver = build_weaver(store, llm)
+
+    weaver.add_dialogues(
+        [Dialogue(dialogue_id=1, speaker="Melanie", content="I paint",
+                  timestamp="1:00 pm on 1 May, 2023")]
+    )
+    weaver.add_dialogues(
+        [Dialogue(dialogue_id=2, speaker="Melanie", content="prices",
+                  timestamp="1:00 pm on 8 June, 2023")]
+    )
+    weaver.process_remaining()
+
+    assert weaver.stats["profiles_written"] == 1
+    assert weaver.stats["profiles_unchanged"] == 1
+    profiles = [
+        entry for entry in store.get_all_entries()
+        if entry.kind == KIND_ENTITY_PROFILE
+    ]
+    assert len(profiles) == 1
+    assert profiles[0].valid_from == "2023-05-01", "kept row keeps its own date"

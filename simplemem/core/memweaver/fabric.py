@@ -34,13 +34,19 @@ class ThreadState:
     summary_entry_id: str = ""
     updated_on: str = ""
 
-    def one_line(self) -> str:
-        """One-line rendering used in the Call A thread catalogue."""
+    def one_line(self, with_id: bool = True) -> str:
+        """One-line rendering of the thread.
+
+        ``with_id`` keeps the internal thread id, which Call A needs to reference
+        a thread. Retrievable text (entity profiles) leaves it out: the id means
+        nothing to an embedder or to a reader of the answer context.
+        """
         summary = " ".join((self.summary or "").split())
         if len(summary) > 240:
             summary = summary[:237] + "..."
         title = self.title or "(untitled)"
-        return f"[{self.thread_id}] {title}" + (f" - {summary}" if summary else "")
+        head = f"[{self.thread_id}] {title}" if with_id else title
+        return head + (f" - {summary}" if summary else "")
 
 
 @dataclass
@@ -154,7 +160,7 @@ def build_entity_profile_entry(
     There is no capacity parameter here: LoCoMo has exactly two speakers per
     conversation, and a profile spans every thread that speaker appears in.
     """
-    lines = [thread.one_line() for thread in threads]
+    lines = [thread.one_line(with_id=False) for thread in threads]
     body = " | ".join(line for line in lines if line)
     text = f"{name} - ongoing threads across the conversation: {body}" if body else name
 

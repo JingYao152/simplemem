@@ -48,6 +48,7 @@
 | `SWEEP_SCAN_DEPTH` | 12 | 为拿到 3 个跨线程近邻而多取的行数，纯实现细节 |
 | `SWEEP_BATCH_SIZE` | 20 | 判定 prompt 的分批大小；所有候选对都会被判定，不改变任何决策 |
 | `CONTEXT_PREFIX_MAX_CHARS` | 200 | P1 上下文前缀的渲染长度上限，格式常数（同 `ThreadState.one_line()` 的 240） |
+| `_ABBREVIATION_MAX_LEN` | 3 | 判定"句号属于缩写而非句末"的词长阈值，格式启发式 |
 | `EVIDENCE_HIT_THRESHOLD` | 0.3 | **评测侧**命中判定阈值，不属于系统参数 |
 
 扫描没有引入"相似度阈值"：候选对由"top-3 跨线程近邻"结构性给出，避免新增
@@ -193,7 +194,8 @@ evidence，因此按词法对齐，并按**对话自身的 IDF** 加权：某条
 |---|---|
 | `recontext_reembedded` | 因摘要重写而重嵌入的事实数（本地计算，零 API 成本） |
 | `recontext_up_to_date` | 被点名但指纹已是当前上下文、因此跳过的事实数（幂等命中） |
-| `profiles_written` | 写入的档案行数（≈ 说话人数 × session 数） |
+| `profiles_written` | 实际写入的档案行数 |
+| `profiles_unchanged` | 该说话人参与的线程本 session 没变、因此跳过重写的次数 |
 
 ## 8. 尚未实现（按设计留给 P2）
 

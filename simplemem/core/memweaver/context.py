@@ -30,7 +30,12 @@ from typing import Optional
 #: (compare ThreadState.one_line() for the Call A catalogue).
 CONTEXT_PREFIX_MAX_CHARS = 200
 
-_SENTENCE_ENDINGS = (". ", "! ", "? ")
+#: A token this short before a period (or one that already contains a period) is
+#: read as an abbreviation rather than a sentence end, so "Melanie moved to St.
+#: Louis" is not clipped to "Melanie moved to St.". Formatting heuristic.
+_ABBREVIATION_MAX_LEN = 3
+
+_SENTENCE_PUNCTUATION = ".!?"
 
 
 def context_prefix(summary: Optional[str], title: Optional[str] = "") -> str:
@@ -47,18 +52,32 @@ def context_prefix(summary: Optional[str], title: Optional[str] = "") -> str:
         return ""
 
     # First sentence, so the prefix stays a single topical statement.
-    cut = len(text)
-    for ending in _SENTENCE_ENDINGS:
-        position = text.find(ending)
-        if position != -1:
-            cut = min(cut, position + 1)
-    text = text[:cut].strip()
+    text = _first_sentence(text)
 
     if len(text) > CONTEXT_PREFIX_MAX_CHARS:
         clipped = text[:CONTEXT_PREFIX_MAX_CHARS]
         boundary = clipped.rfind(" ")
         text = (clipped[:boundary] if boundary > 0 else clipped).rstrip() + "..."
     return text
+
+
+def _looks_like_abbreviation(text: str) -> bool:
+    """True when the token ending at ``text``'s last character reads as "St."."""
+    token = text.rsplit(" ", 1)[-1]
+    return len(token) <= _ABBREVIATION_MAX_LEN or "." in token
+
+
+def _first_sentence(text: str) -> str:
+    """First sentence of a single-line text, tolerating common abbreviations."""
+    for index, char in enumerate(text):
+        if char not in _SENTENCE_PUNCTUATION:
+            continue
+        if index + 1 >= len(text) or text[index + 1] != " ":
+            continue
+        if char == "." and _looks_like_abbreviation(text[:index]):
+            continue
+        return text[: index + 1].strip()
+    return text.strip()
 
 
 def contextual_embed_text(prefix: str, restatement: str) -> str:

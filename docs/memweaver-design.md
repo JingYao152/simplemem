@@ -128,12 +128,20 @@ anchor = 记忆库最大 session 日期        // LoCoMo 无 question_date → �
               valid_until == "" OR valid_until >= anchor      ← C3 织物衍生
             when 类问题不过滤（问历史需要旧事实）
 
-→ 束扩展: 每个 fact 候选 + 其线程摘要 + links/superseded_by 完整一跳闭包
-          （evidence 实测均值 1.42 → 链接度数结构性低，无截断参数）← C3 织物衍生
-→ 交叉编码器束重排（BAAI/bge-reranker-v2-m3，本地推理）取 RERANK_TOP_K=10
+→ 一跳扩展（起点 = 候选集中每个 kind="fact" 条目；摘要/档案不向外扩展）:
+    ① supersede 链双向（superseded_by 及反向）→ 事实演化链成员    // cat2
+    ② weave 边双向（links: refine/bridge）→ 跨线程桥接事实        // cat3
+    ③ 结构归属边（thread_id → 活体摘要条目）→ 主题语境            // cat4
+  仅一跳、入池去重；每个新条目记录 provenance（锚点 + 边类型）
+  （evidence 实测均值 1.42 → 链接度数结构性低，无截断参数）← C3 织物衍生
+→ 交叉编码器平铺精排（BAAI/bge-reranker-v2-m3，本地推理）:
+  扩展后全池逐条打分，取 top RERANK_TOP_K=20 作为回答上下文。
+  扩展条目的打分输入带 provenance 短前缀（如 "[bridge of: <锚点句>]"）——
+  bridge 事实与 query 直接相似度低（正是其未被检索命中的原因），
+  裸文本精排会再次排掉它们；锚点候选自身裸文本打分
           ← 唯一保留的通用读侧组件（继承标注，不进贡献声明）
 → 生成: SimpleMem 原生回答 prompt（不加题型格式化）；
-        temporal 题渲染 supersede 链:
+        supersede 链成员相邻排布并标注:
         "[SUPERSEDED on <d> by Context N]"（时间题常问"之前是什么"）← C3
 ```
 
@@ -159,7 +167,7 @@ person 过滤禁用、题型格式化 prompt、充分性门控（cat5 由评测 
 
 | 常数 | 值 | 性质 |
 |---|---|---|
-| RERANK_TOP_K | 10 | 重排后进入回答的束数，容量常数 |
+| RERANK_TOP_K | 20 | 精排后进入回答上下文的条目数，容量常数（初版固定） |
 
 检索基座沿用 SimpleMem 原生配置（SEMANTIC_TOP_K=25 / KEYWORD_TOP_K=5 /
 STRUCTURED_TOP_K=5 / MAX_REFLECTION_ROUNDS=2），与 baseline 逐项相同，
@@ -176,14 +184,14 @@ STRUCTURED_TOP_K=5 / MAX_REFLECTION_ROUNDS=2），与 baseline 逐项相同，
 |---|---|---|
 | P0 | 数据模型 + 后端三能力 + Call A/B 写管线 + supersede + as-of 检索 + 兜底扫描 | cat2 时间题(321) |
 | P1 | 上下文继承嵌入 + outdated_facts 重嵌入 + 实体档案入池 | cat1 单跳(282)、cat4 开放域(841) |
-| P2 | 束扩展 + 交叉编码器束重排 | cat3 多跳(96) + 全局 |
+| P2 | 一跳扩展 + 交叉编码器平铺精排 | cat3 多跳(96) + 全局 |
 
 验证方法：每阶段同 harness A/B（test_locomo10.py）；另用 QA 的 evidence 字段
 直接量**检索命中率**（session/dia_id 级），不必等端到端分数。
 
 消融开关（config，每项对应论文消融表一行）：
 ENABLE_MEMWEAVER / ENABLE_WEAVING / ENABLE_SWEEP / ENABLE_RECONTEXT /
-ENABLE_BUNDLE_RERANK。
+ENABLE_EXPAND_RERANK（一跳扩展+精排整体开关）。
 
 ## 9. 成本与风险
 
@@ -227,8 +235,8 @@ ENABLE_BUNDLE_RERANK。
 组件是交叉编码器重排器，标注为继承组件、不进贡献声明。声称的贡献
 严格限于：C1 写时自组织织物（线程/活体摘要/类型化编织）、C2 组织⇄
 表示协同演化（上下文继承嵌入 + 语义触发重嵌入）、C3 织物衍生的读取
-原语（as-of 时点检索与证据束——强调其存在依赖织物结构：无
-valid_until 即无 as-of，无 weave 边即无束）。时间锚本身不新，新的是
+原语（as-of 时点检索与一跳证据扩展——强调其存在依赖织物结构：无
+valid_until 即无 as-of，无 weave 边即无一跳扩展）。时间锚本身不新，新的是
 锚作用于写时编织产生的有效期而非分数软衰减。
 **Baseline parity 纪律**：所有对照系统配备同一个重排器（唯一的通用
 读侧组件）后再比较，检索基座与回答 prompt 均为 SimpleMem 原生且各系统

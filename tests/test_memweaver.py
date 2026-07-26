@@ -389,6 +389,35 @@ def test_lancedb_table_migrates_pre_memweaver_schema(tmp_path):
     assert store.get_by_ids(["fresh"])[0].thread_id == "t1"
 
 
+def test_failed_fts_build_is_retried_per_mutation_not_per_query(store, monkeypatch):
+    """A broken full-text index must not be rebuilt once per lexical query."""
+    store.add_entries(
+        [MemoryEntry(entry_id="f1", lossless_restatement="Alice drinks coffee")]
+    )
+
+    attempts = []
+
+    def failing_create_fts_index(*args, **kwargs):
+        attempts.append(1)
+        raise RuntimeError("tantivy unavailable")
+
+    monkeypatch.setattr(
+        store.backend.table, "create_fts_index", failing_create_fts_index
+    )
+
+    for _ in range(3):
+        assert store.keyword_search(["coffee"], top_k=5) == []
+    assert len(attempts) == 1, "index build retried on every query"
+
+    # A write marks the index stale again, so a transient failure can recover.
+    store.add_entries(
+        [MemoryEntry(entry_id="f2", lossless_restatement="Alice quit coffee")]
+    )
+    store.keyword_search(["coffee"], top_k=5)
+    store.keyword_search(["coffee"], top_k=5)
+    assert len(attempts) == 2
+
+
 def test_filter_expression_rejects_bad_operator():
     with pytest.raises(ValueError, match="Unsupported filter operator"):
         FieldPredicate("LIKE", "x")
@@ -923,6 +952,30 @@ def test_sweep_skips_same_thread_and_same_day_pairs(store):
     # a/b share a thread; a/c share a date -> nothing is orderable but b/c.
     assert weaver.stats["sweep_unordered_pairs"] >= 1
     assert all(entry.is_open for entry in facts_of(store) if entry.entry_id != "b")
+
+
+def test_sweep_counts_each_unorderable_pair_once(store):
+    """Same-day cross-thread pairs are skipped, and counted per pair."""
+    store.add_entries(
+        [
+            MemoryEntry(
+                entry_id=entry_id,
+                lossless_restatement=f"{entry_id} drinks coffee",
+                thread_id=thread_id,
+                valid_from="2023-05-01",
+            )
+            for entry_id, thread_id in (("a", "t1"), ("b", "t2"), ("c", "t3"))
+        ]
+    )
+    llm = ScriptedLLM(sweep=[json.dumps({"judgements": []})])
+    weaver = build_weaver(store, llm)
+
+    weaver.finalize()
+
+    # Three distinct pairs among three facts, each seen from both endpoints.
+    assert weaver.stats["sweep_unordered_pairs"] == 3
+    assert weaver.stats["sweep_supersedes"] == 0
+    assert all(entry.is_open for entry in facts_of(store))
 
 
 def test_sweep_disabled_leaves_the_fabric_untouched(store):

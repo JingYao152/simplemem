@@ -1090,7 +1090,7 @@ Return ONLY the JSON, no other text.
 
             # Retrieval hit rate from QA evidence (independent of answer quality)
             if 'retrieval_hit_any' in overall:
-                print(f"\nRetrieval Hit Rate (QA evidence, dia_id level):")
+                print("\nRetrieval Hit Rate (QA evidence, dia_id level):")
                 for metric_name in RETRIEVAL_METRIC_KEYS:
                     if metric_name in overall:
                         stats = overall[metric_name]
@@ -1099,7 +1099,7 @@ Return ONLY the JSON, no other text.
                             f"(±{stats['std']:.4f}, n={stats['count']})"
                         )
 
-                print(f"\nRetrieval Hit Rate per Category:")
+                print("\nRetrieval Hit Rate per Category:")
                 for key in sorted(aggregated.keys()):
                     if not key.startswith('category_'):
                         continue
@@ -1184,6 +1184,14 @@ def main():
         enable_weaving=args.weaving,
         enable_sweep=args.sweep
     )
+
+    # The ablations only mean something on the MemWeaver arm; say so loudly
+    # rather than producing a baseline run that looks like an ablation.
+    if (args.weaving is False or args.sweep is False) and not system.enable_memweaver:
+        print(
+            "WARNING: --no-weaving / --no-sweep are MemWeaver ablations but "
+            "MemWeaver is disabled; this run is the plain baseline."
+        )
 
     # Create tester
     tester = LoCoMoTester(system, args.dataset, use_llm_judge=args.llm_judge, test_workers=args.test_workers)

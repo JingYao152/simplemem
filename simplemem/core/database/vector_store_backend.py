@@ -256,9 +256,13 @@ class LanceDBVectorStoreBackend:
                         replace=True,
                     )
                     print("FTS index created (Tantivy mode)")
-                self._fts_dirty = False
             except Exception as error:
+                # Clearing the flag on failure too bounds the cost to one attempt
+                # per mutation instead of one per lexical query; the next write
+                # marks the index stale again, so a transient failure recovers.
                 print(f"FTS index creation skipped: {error}")
+            finally:
+                self._fts_dirty = False
 
     def insert(self, records: Sequence[VectorStoreRecord]) -> None:
         if not records:

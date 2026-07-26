@@ -791,6 +791,7 @@ class MemWeaver:
             [fact.lossless_restatement for fact in open_facts]
         )
         by_key: Dict[Tuple[str, str], dict] = {}
+        unorderable: set = set()
 
         for fact, vector in zip(open_facts, vectors):
             neighbours = self.vector_store.semantic_search_by_vector(
@@ -810,10 +811,14 @@ class MemWeaver:
                 picked += 1
 
                 key = tuple(sorted((fact.entry_id, neighbour.entry_id)))
-                if key in by_key:
+                if key in by_key or key in unorderable:
                     continue
                 ordered = self._order_by_date(fact, neighbour)
                 if ordered is None:
+                    # Same-day facts (typically the same session) carry no
+                    # deterministic direction, so they are left alone. Counted
+                    # once per distinct pair, not once per encounter.
+                    unorderable.add(key)
                     self._bump("sweep_unordered_pairs")
                     continue
                 earlier, later = ordered

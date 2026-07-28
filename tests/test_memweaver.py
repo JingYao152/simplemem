@@ -1403,6 +1403,45 @@ def test_outdated_facts_are_reembedded_under_the_rewritten_summary(recording_sto
     ) in recording_store.embedding_model.documents
 
 
+def test_summary_digest_change_reembeds_all_open_facts_without_outdated_signal(
+    recording_store,
+):
+    llm = ScriptedLLM(
+        assignment=[
+            assignment(([1], "new:Painting hobby")),
+            assignment(([1], "existing:t1")),
+        ],
+        thread_update=[
+            thread_update(
+                [
+                    fact("Melanie bought watercolor brushes."),
+                    fact("Melanie joined a painting class."),
+                ],
+                summary="Melanie is starting to paint.",
+            ),
+            thread_update(
+                [fact("Melanie sold a painting.")],
+                summary="Melanie now sells her watercolour paintings.",
+            ),
+        ],
+    )
+    weaver = build_weaver(
+        recording_store,
+        llm,
+        enable_thread_wide_recontext=True,
+    )
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "brushes"))
+    weaver.process_remaining()
+    weaver.add_dialogues(turns("1:00 pm on 8 June, 2023", "sold", start=2))
+    weaver.process_remaining()
+
+    digest = context_digest("Melanie now sells her watercolour paintings.")
+    assert weaver.stats["recontext_reembedded"] == 2
+    assert by_text(recording_store, "watercolor brushes").context_digest == digest
+    assert by_text(recording_store, "painting class").context_digest == digest
+
+
 def test_reembedding_is_idempotent_via_the_context_digest(recording_store):
     weaver = build_weaver(recording_store, _recontext_llm())
 

@@ -33,6 +33,10 @@ from simplemem.core.memweaver.context import (
     context_prefix,
     contextual_embed_text,
 )
+from simplemem.core.memweaver.dual_view import (
+    state_anchor_digest,
+    state_anchor_text,
+)
 from simplemem.core.memweaver.dates import parse_session_datetime, to_day
 from simplemem.core.memweaver.fabric import (
     FabricSnapshot,
@@ -121,7 +125,10 @@ class MemWeaver:
         temperature: Optional[float] = None,
         fallback_extractor: Optional[MemoryBuilder] = None,
         enable_recontext: Optional[bool] = None,
+        enable_thread_wide_recontext: Optional[bool] = None,
         enable_entity_profiles: Optional[bool] = None,
+        state_anchor_store: Optional[VectorStore] = None,
+        enable_dual_view_state_anchors: Optional[bool] = None,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
@@ -141,6 +148,26 @@ class MemWeaver:
             enable_recontext
             if enable_recontext is not None
             else getattr(config, "ENABLE_RECONTEXT", True)
+        )
+        self.enable_dual_view_state_anchors = (
+            enable_dual_view_state_anchors
+            if enable_dual_view_state_anchors is not None
+            else getattr(config, "ENABLE_DUAL_VIEW_STATE_ANCHORS", False)
+        )
+        self.state_anchor_store = state_anchor_store
+        if self.enable_dual_view_state_anchors:
+            if self.state_anchor_store is None:
+                raise ValueError(
+                    "state_anchor_store is required when dual-view state anchors are enabled"
+                )
+            # Dual-view mode reserves the primary index for bare facts. The
+            # companion index carries state metadata, so mutable summaries never
+            # alter the primary fact representation.
+            self.enable_recontext = False
+        self.enable_thread_wide_recontext = (
+            enable_thread_wide_recontext
+            if enable_thread_wide_recontext is not None
+            else getattr(config, "ENABLE_THREAD_WIDE_RECONTEXT", False)
         )
         # P1: person-level living profiles in the retrieval pool.
         self.enable_entity_profiles = (
@@ -191,6 +218,7 @@ class MemWeaver:
             "outdated_signals": 0,
             "recontext_reembedded": 0,
             "recontext_up_to_date": 0,
+            "state_anchors_written": 0,
             "profiles_written": 0,
             "profiles_unchanged": 0,
             "sweep_pairs_judged": 0,
@@ -235,10 +263,18 @@ class MemWeaver:
         else:
             print("[MemWeaver] Cross-thread sweep disabled (ENABLE_SWEEP=False)")
 
+        self._refresh_state_anchor_index()
+
         try:
             self.vector_store.optimize()
         except Exception as error:  # optimization is best-effort
             print(f"[MemWeaver] optimize skipped: {error}")
+
+        if self.state_anchor_store is not None and self.enable_dual_view_state_anchors:
+            try:
+                self.state_anchor_store.optimize()
+            except Exception as error:  # optimization is best-effort
+                print(f"[MemWeaver] state-anchor optimize skipped: {error}")
 
         self.print_stats()
 
@@ -841,17 +877,25 @@ class MemWeaver:
         operation idempotent, so a fact already embedded under this context is
         left alone. Fact text is never touched.
         """
-        if not self.enable_recontext or not update.outdated_facts:
+        if not self.enable_recontext:
             return
 
         candidates = snapshot.facts(assignment.thread_id)
+        if self.enable_thread_wide_recontext:
+            selected = [fact for fact in candidates if fact.is_open]
+        else:
+            if not update.outdated_facts:
+                return
+            selected = [
+                candidates[index - 1]
+                for index in dict.fromkeys(update.outdated_facts)
+            ]
+
         digest = context_digest(prefix)
         targets: List[MemoryEntry] = []
         texts: List[str] = []
 
-        # A repeated candidate number must not be re-embedded (or counted) twice.
-        for index in dict.fromkeys(update.outdated_facts):
-            fact = candidates[index - 1]
+        for fact in selected:
             if fact.context_digest == digest:
                 self._bump("recontext_up_to_date")
                 continue
@@ -866,6 +910,38 @@ class MemWeaver:
         print(
             f"[MemWeaver] re-contextualized {len(targets)} fact(s) of "
             f"{assignment.thread_id} under the rewritten summary"
+        )
+
+    def _refresh_state_anchor_index(self) -> None:
+        """Materialize one versioned state-anchor vector per persisted fact.
+
+        The writer finalizes all weave and sweep updates before this refresh, so
+        the companion table always contains the same validity and relation
+        metadata as the primary fact table. Rebuilding at finalize avoids an
+        extra local embedding pass after every session.
+        """
+        if not self.enable_dual_view_state_anchors or self.state_anchor_store is None:
+            return
+
+        facts = [
+            entry
+            for entry in self.vector_store.get_all_entries()
+            if entry.kind == KIND_FACT
+        ]
+        anchor_entries = []
+        for entry in facts:
+            fields = entry.model_dump()
+            fields["context_digest"] = state_anchor_digest(entry)
+            anchor_entries.append(MemoryEntry(**fields))
+        self.state_anchor_store.clear()
+        if anchor_entries:
+            self.state_anchor_store.add_entries(
+                anchor_entries,
+                embed_texts=[state_anchor_text(entry) for entry in facts],
+            )
+        self._bump("state_anchors_written", len(anchor_entries))
+        print(
+            f"[MemWeaver] refreshed {len(anchor_entries)} state-anchor vectors"
         )
 
     def _update_profiles(

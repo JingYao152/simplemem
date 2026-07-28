@@ -780,16 +780,35 @@ Return ONLY the JSON, no other text.
                     print(f"Warning: Failed to generate category 5 answer after {max_retries} attempts: {e}")
                     return "Not mentioned in the conversation"  # Default to safe answer
 
-    def load_dataset(self, limit: int = None) -> List[LoCoMoSample]:
+    def load_dataset(
+        self,
+        limit: int = None,
+        sample_indices: Optional[List[int]] = None,
+    ) -> List[tuple[int, LoCoMoSample]]:
         """Load LoComo10 dataset"""
         print(f"Loading dataset from {self.dataset_path}...")
         samples = load_locomo_dataset(self.dataset_path)
+
+        if sample_indices is not None:
+            selected = []
+            seen = set()
+            for sample_idx in sample_indices:
+                if sample_idx in seen:
+                    raise ValueError(f"Duplicate sample index: {sample_idx}")
+                if sample_idx < 0 or sample_idx >= len(samples):
+                    raise ValueError(
+                        f"Sample index {sample_idx} is outside 0..{len(samples) - 1}"
+                    )
+                seen.add(sample_idx)
+                selected.append((sample_idx, samples[sample_idx]))
+            print(f"Selected source samples: {sample_indices}")
+            return selected
 
         if limit:
             samples = samples[:limit]
             print(f"Limited to {limit} samples")
 
-        return samples
+        return list(enumerate(samples))
 
     def convert_to_dialogues(self, sample: LoCoMoSample) -> List[Dialogue]:
         """Convert LoComo sample to Dialogue objects"""
@@ -1027,6 +1046,8 @@ Return ONLY the JSON, no other text.
             flags.append('no-recontext')
         if not weaver.enable_entity_profiles:
             flags.append('no-profiles')
+        if getattr(weaver, 'enable_dual_view_state_anchors', False):
+            flags.append('dual-state-anchors')
         flags.extend(self._read_stage_flags())
         return 'memweaver' + (f" ({', '.join(flags)})" if flags else '')
 
@@ -1042,20 +1063,31 @@ Return ONLY the JSON, no other text.
             + ([] if retriever.enable_rerank else ['no-rerank'])
         )
 
-    def run_test(self, num_samples: int = None, save_results: bool = True, result_file: str = 'locomo10_test_results.json', enable_parallel_questions: bool = False):
+    def run_test(
+        self,
+        num_samples: int = None,
+        sample_indices: Optional[List[int]] = None,
+        save_results: bool = True,
+        result_file: str = 'locomo10_test_results.json',
+        enable_parallel_questions: bool = False,
+    ):
         """Run full test on dataset"""
         print("\n" + "="*80)
         print(f" SimpleMem LoComo10 Dataset Test [{self.arm_name()}]".center(80))
         print("="*80 + "\n")
 
         # Load dataset
-        samples = self.load_dataset(limit=num_samples)
+        samples = self.load_dataset(
+            limit=num_samples,
+            sample_indices=sample_indices,
+        )
         total_samples = len(samples)
+        selected_indices = [sample_idx for sample_idx, _ in samples]
 
         all_results = []
 
         # Test each sample
-        for sample_idx, sample in enumerate(samples):
+        for sample_idx, sample in samples:
             # Clear system for each sample
             self.system.vector_store.clear()
 
@@ -1141,6 +1173,7 @@ Return ONLY the JSON, no other text.
                 json.dump({
                     'summary': {
                         'num_samples': total_samples,
+                        'sample_indices': selected_indices,
                         'num_questions': len(all_results),
                         'arm': self.arm_name(),
                         'memweaver': bool(getattr(self.system, 'enable_memweaver', False)),
@@ -1152,6 +1185,13 @@ Return ONLY the JSON, no other text.
                         ),
                         'rerank_top_k': getattr(
                             self.system.hybrid_retriever.reranker, 'top_k', None
+                        ),
+                        'dual_view_state_anchors': bool(
+                            getattr(
+                                self.system.hybrid_retriever,
+                                'enable_dual_view_state_anchors',
+                                False,
+                            )
                         ),
                         'avg_retrieval_time': sum(self.retrieval_times)/len(self.retrieval_times),
                         'avg_answer_time': sum(self.answer_times)/len(self.answer_times),
@@ -1180,6 +1220,8 @@ def main():
                        help='Path to LoComo10 dataset')
     parser.add_argument('--num-samples', type=int, default=None,
                        help='Number of samples to test (default: all)')
+    parser.add_argument('--sample-indices', type=int, nargs='+', default=None,
+                       help='Original LoCoMo sample indices to test, for example: --sample-indices 9')
     parser.add_argument('--no-save', action='store_true',
                        help='Do not save results to file')
     parser.add_argument('--result-file', type=str, default='locomo10_test_results.json',
@@ -1205,6 +1247,9 @@ def main():
                        help='Ablation: embed facts as bare sentences (no thread-context prefix)')
     parser.add_argument('--no-profiles', dest='profiles', action='store_false', default=None,
                        help='Ablation: do not write entity profiles into the pool')
+    parser.add_argument('--dual-view-state-anchors', dest='dual_view_state_anchors',
+                       action='store_true', default=None,
+                       help='Use a bare-fact index plus a versioned state-anchor index')
     parser.add_argument('--no-expand-rerank', dest='expand_rerank', action='store_false', default=None,
                        help='Ablation: turn the whole P2 read stage off (no expansion, '
                             'no rerank). Use it for the pure-SimpleMem reference number.')
@@ -1217,6 +1262,8 @@ def main():
                             '(baseline parity, design doc section 10).')
 
     args = parser.parse_args()
+    if args.num_samples is not None and args.sample_indices is not None:
+        parser.error('--num-samples and --sample-indices cannot be used together')
 
     # Create system
     print("Initializing SimpleMem system...")
@@ -1227,6 +1274,7 @@ def main():
         enable_sweep=args.sweep,
         enable_recontext=args.recontext,
         enable_entity_profiles=args.profiles,
+        enable_dual_view_state_anchors=args.dual_view_state_anchors,
         enable_expand_rerank=args.expand_rerank,
         enable_expansion=args.expansion,
         enable_rerank=args.rerank
@@ -1256,6 +1304,7 @@ def main():
     # Run test
     results = tester.run_test(
         num_samples=args.num_samples,
+        sample_indices=args.sample_indices,
         save_results=not args.no_save,
         result_file=args.result_file,
         enable_parallel_questions=args.parallel_questions

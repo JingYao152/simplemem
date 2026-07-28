@@ -28,6 +28,13 @@ from simplemem.core.memweaver.context import (
     contextual_embed_text,
 )
 from simplemem.core.memweaver.dates import parse_session_datetime, to_day
+from simplemem.core.memweaver.dual_view import (
+    STATE_ANCHOR_TABLE_SUFFIX,
+    STATE_ANCHOR_VERSION,
+    state_anchor_digest,
+    state_anchor_table_name,
+    state_anchor_text,
+)
 from simplemem.core.memweaver.expansion import (
     ExpandedPool,
     Provenance,
@@ -72,4 +79,9 @@ __all__ = [
     "Provenance",
     "parse_session_datetime",
     "to_day",
+    "STATE_ANCHOR_TABLE_SUFFIX",
+    "STATE_ANCHOR_VERSION",
+    "state_anchor_digest",
+    "state_anchor_table_name",
+    "state_anchor_text",
 ]

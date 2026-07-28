@@ -9,6 +9,7 @@ from simplemem.core.utils.embedding import EmbeddingModel
 from simplemem.core.database.vector_store import VectorStore
 from simplemem.core.memory_builder import MemoryBuilder
 from simplemem.core.memweaver import MemWeaver
+from simplemem.core.memweaver.dual_view import state_anchor_table_name
 from simplemem.core.hybrid_retriever import HybridRetriever
 from simplemem.core.answer_generator import AnswerGenerator
 
@@ -50,6 +51,7 @@ class SimpleMemSystem:
         enable_sweep: Optional[bool] = None,
         enable_recontext: Optional[bool] = None,
         enable_entity_profiles: Optional[bool] = None,
+        enable_dual_view_state_anchors: Optional[bool] = None,
         enable_expand_rerank: Optional[bool] = None,
         enable_expansion: Optional[bool] = None,
         enable_rerank: Optional[bool] = None
@@ -100,10 +102,27 @@ class SimpleMemSystem:
             embedding_model=self.embedding_model,
             table_name=table_name
         )
+        self.enable_dual_view_state_anchors = (
+            enable_dual_view_state_anchors
+            if enable_dual_view_state_anchors is not None
+            else getattr(config, 'ENABLE_DUAL_VIEW_STATE_ANCHORS', False)
+        )
+        primary_table_name = table_name or config.MEMORY_TABLE_NAME
+        self.state_anchor_store = (
+            VectorStore(
+                db_path=db_path,
+                embedding_model=self.embedding_model,
+                table_name=state_anchor_table_name(primary_table_name),
+            )
+            if self.enable_dual_view_state_anchors
+            else None
+        )
 
         if clear_db:
             print("\nClearing existing database...")
             self.vector_store.clear()
+            if self.state_anchor_store is not None:
+                self.state_anchor_store.clear()
 
         # Initialize three major modules
         self.memory_builder = MemoryBuilder(
@@ -128,13 +147,16 @@ class SimpleMemSystem:
                 max_parallel_workers=max_parallel_workers,
                 fallback_extractor=self.memory_builder,
                 enable_recontext=enable_recontext,
-                enable_entity_profiles=enable_entity_profiles
+                enable_entity_profiles=enable_entity_profiles,
+                state_anchor_store=self.state_anchor_store,
+                enable_dual_view_state_anchors=self.enable_dual_view_state_anchors,
             )
             print(
                 "\nMemWeaver write pipeline enabled "
                 f"(weaving={self.memweaver.enable_weaving}, "
                 f"sweep={self.memweaver.enable_sweep}, "
                 f"recontext={self.memweaver.enable_recontext}, "
+                f"dual_view_state_anchors={self.memweaver.enable_dual_view_state_anchors}, "
                 f"profiles={self.memweaver.enable_entity_profiles}, "
                 f"temperature={self.memweaver.temperature})"
             )
@@ -153,7 +175,9 @@ class SimpleMemSystem:
             enable_memweaver=self.enable_memweaver,
             enable_expand_rerank=enable_expand_rerank,
             enable_expansion=enable_expansion,
-            enable_rerank=enable_rerank
+            enable_rerank=enable_rerank,
+            state_anchor_store=self.state_anchor_store,
+            enable_dual_view_state_anchors=self.enable_dual_view_state_anchors,
         )
 
         # The supersede-chain annotation is what makes expansion-recovered history
@@ -290,6 +314,7 @@ def create_system(
     enable_sweep: Optional[bool] = None,
     enable_recontext: Optional[bool] = None,
     enable_entity_profiles: Optional[bool] = None,
+    enable_dual_view_state_anchors: Optional[bool] = None,
     enable_expand_rerank: Optional[bool] = None,
     enable_expansion: Optional[bool] = None,
     enable_rerank: Optional[bool] = None
@@ -311,6 +336,7 @@ def create_system(
         enable_sweep=enable_sweep,
         enable_recontext=enable_recontext,
         enable_entity_profiles=enable_entity_profiles,
+        enable_dual_view_state_anchors=enable_dual_view_state_anchors,
         enable_expand_rerank=enable_expand_rerank,
         enable_expansion=enable_expansion,
         enable_rerank=enable_rerank

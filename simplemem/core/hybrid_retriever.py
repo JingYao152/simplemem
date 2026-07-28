@@ -17,6 +17,7 @@ from simplemem.core.memweaver.asof import (
     is_temporal_history_question,
 )
 from simplemem.core.memweaver.expansion import expand_one_hop, scoring_text
+from simplemem.core.memweaver.bundles import select_requirement_bundles
 from simplemem.core.reranker import CrossEncoderReranker
 from simplemem.core.settings import settings as config
 import re
@@ -53,7 +54,10 @@ class HybridRetriever:
         enable_expand_rerank: Optional[bool] = None,
         enable_expansion: Optional[bool] = None,
         enable_rerank: Optional[bool] = None,
-        reranker: Optional[CrossEncoderReranker] = None
+        enable_requirement_bundles: Optional[bool] = None,
+        reranker: Optional[CrossEncoderReranker] = None,
+        state_anchor_store: Optional[VectorStore] = None,
+        enable_dual_view_state_anchors: Optional[bool] = None,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
@@ -93,6 +97,28 @@ class HybridRetriever:
         # Neither part of P2 is tied to enable_memweaver: on baseline data
         # expansion simply finds no fabric edges to walk.
         self.enable_expand_rerank = self.enable_expansion or self.enable_rerank
+        self.enable_requirement_bundles = (
+            self.enable_memweaver
+            and self.enable_rerank
+            and (
+                enable_requirement_bundles
+                if enable_requirement_bundles is not None
+                else getattr(config, "ENABLE_REQUIREMENT_BUNDLES", False)
+            )
+        )
+        self.enable_dual_view_state_anchors = (
+            self.enable_memweaver
+            and (
+                enable_dual_view_state_anchors
+                if enable_dual_view_state_anchors is not None
+                else getattr(config, "ENABLE_DUAL_VIEW_STATE_ANCHORS", False)
+            )
+        )
+        self.state_anchor_store = state_anchor_store
+        if self.enable_dual_view_state_anchors and self.state_anchor_store is None:
+            raise ValueError(
+                "state_anchor_store is required when dual-view state anchors are enabled"
+            )
         self.reranker = reranker or CrossEncoderReranker()
 
         # Use config values as default if not explicitly provided
@@ -225,7 +251,11 @@ class HybridRetriever:
             )
 
         # Step 6: one-hop fabric expansion + flat cross-encoder rerank (P2)
-        return self._expand_and_rerank(query, merged_results)
+        return self._expand_and_rerank(
+            query,
+            merged_results,
+            information_plan=information_plan,
+        )
 
     # ------------------------------------------------------------------
     # One-hop expansion + rerank (design doc section 5)
@@ -234,7 +264,9 @@ class HybridRetriever:
     def _expand_and_rerank(
         self,
         query: str,
-        candidates: List[MemoryEntry]
+        candidates: List[MemoryEntry],
+        information_plan: Optional[Dict[str, Any]] = None,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> List[MemoryEntry]:
         """Walk the fabric one hop, then score the whole pool and keep top-k.
 
@@ -245,7 +277,7 @@ class HybridRetriever:
         if not candidates:
             return candidates
 
-        provenance = {}
+        provenance = dict(provenance or {})
         entries = candidates
         if self.enable_expansion:
             pool = expand_one_hop(self.vector_store, candidates)
@@ -271,13 +303,36 @@ class HybridRetriever:
             # top-k stage at all.
             return entries
 
+        bundle_enabled = bool(
+            self.enable_requirement_bundles
+            and information_plan
+            and information_plan.get("required_info")
+        )
         ranked, reranked = self.reranker.rerank(
             query,
             entries,
             to_text=lambda entry: scoring_text(
                 entry, provenance.get(entry.entry_id)
             ),
+            top_k=len(entries) if bundle_enabled else None,
         )
+        if bundle_enabled and reranked:
+            ranked = select_requirement_bundles(
+                required_info=information_plan["required_info"],
+                ranked_entries=ranked,
+                reranker=self.reranker,
+                to_text=lambda entry: scoring_text(
+                    entry, provenance.get(entry.entry_id)
+                ),
+                provenance=provenance,
+                top_k=self.reranker.top_k,
+            )
+            print(
+                f"[Bundles] {len(entries)} ranked candidates -> "
+                f"{len(ranked)} contexts"
+            )
+        elif bundle_enabled:
+            ranked = ranked[:self.reranker.top_k]
         print(
             f"[Rerank] {len(entries)} candidates -> {len(ranked)} contexts"
             + ("" if reranked else " (model unavailable: retrieval order kept)")
@@ -404,11 +459,26 @@ Return ONLY JSON, no other content.
         The as-of predicate is pushed down as a prefilter so the top-k budget is
         spent on entries that are still valid at the anchor.
         """
-        return self.vector_store.semantic_search(
+        filters = asof_filters(as_of) if as_of else None
+        fact_results = self.vector_store.semantic_search(
             query,
             top_k=self.semantic_top_k,
-            filters=asof_filters(as_of) if as_of else None,
+            filters=filters,
         )
+        if not self.enable_dual_view_state_anchors:
+            return fact_results
+
+        anchor_results = self.state_anchor_store.semantic_search(
+            query,
+            top_k=self.semantic_top_k,
+            filters=filters,
+        )
+        merged = self._merge_and_deduplicate_entries(fact_results + anchor_results)
+        print(
+            f"[Dual View] fact={len(fact_results)}, "
+            f"state-anchor={len(anchor_results)}, merged={len(merged)}"
+        )
+        return merged
 
     def _keyword_search(
         self,

@@ -5,7 +5,12 @@ Section 3.3: Intent-Aware Retrieval Planning
 Generates answers from the merged context C_q after multi-view retrieval
 """
 from typing import Dict, List, Optional
-from simplemem.core.models.memory_entry import MemoryEntry
+from simplemem.core.answer_canonicalizer import canonicalize_answer
+from simplemem.core.models.memory_entry import (
+    KIND_FACT,
+    KIND_THREAD_SUMMARY,
+    MemoryEntry,
+)
 from simplemem.core.utils.llm_client import LLMClient
 from simplemem.core.settings import settings as config
 
@@ -25,13 +30,25 @@ class AnswerGenerator:
     def __init__(
         self,
         llm_client: LLMClient,
-        annotate_chains: Optional[bool] = None
+        annotate_chains: Optional[bool] = None,
+        enable_answer_canonicalization: Optional[bool] = None,
+        enable_thread_evidence_crosscheck: Optional[bool] = None,
     ):
         self.llm_client = llm_client
         self.annotate_chains = (
             annotate_chains
             if annotate_chains is not None
             else getattr(config, 'ENABLE_EXPAND_RERANK', False)
+        )
+        self.enable_answer_canonicalization = (
+            enable_answer_canonicalization
+            if enable_answer_canonicalization is not None
+            else getattr(config, 'ENABLE_ANSWER_CANONICALIZATION', False)
+        )
+        self.enable_thread_evidence_crosscheck = (
+            enable_thread_evidence_crosscheck
+            if enable_thread_evidence_crosscheck is not None
+            else getattr(config, 'ENABLE_THREAD_EVIDENCE_CROSSCHECK', False)
         )
 
     def generate_answer(self, query: str, contexts: List[MemoryEntry]) -> str:
@@ -84,7 +101,9 @@ class AnswerGenerator:
                 # Parse JSON response
                 result = self.llm_client.extract_json(response)
                 # Return the answer from JSON
-                return result.get("answer", response.strip())
+                return self._finalize_answer(
+                    result.get("answer", response.strip()), query
+                )
 
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -93,9 +112,15 @@ class AnswerGenerator:
                     print(f"Warning: Failed to parse JSON response after {max_retries} attempts: {e}")
                     # Fallback to raw response
                     if 'response' in locals():
-                        return response.strip()
+                        return self._finalize_answer(response.strip(), query)
                     else:
                         return "Failed to generate answer"
+
+    def _finalize_answer(self, answer: str, query: str) -> str:
+        """Apply the optional deterministic answer canonicalization step."""
+        if not self.enable_answer_canonicalization:
+            return answer
+        return canonicalize_answer(answer, query)
 
     @staticmethod
     def _order_supersede_chains(contexts: List[MemoryEntry]) -> List[MemoryEntry]:
@@ -160,40 +185,170 @@ class AnswerGenerator:
                 )
         return annotations
 
-    def _format_contexts(self, contexts: List[MemoryEntry]) -> str:
-        """
-        Format contexts to readable text
-        """
+    def _prepare_contexts(
+        self, contexts: List[MemoryEntry]
+    ) -> tuple[List[MemoryEntry], Dict[str, str]]:
+        """Preserve chain-aware ordering before rendering the answer context."""
         annotations: Dict[str, str] = {}
         if self.annotate_chains and contexts:
             contexts = self._order_supersede_chains(contexts)
             annotations = self._chain_annotations(contexts)
+        return contexts, annotations
+
+    @staticmethod
+    def _entry_details(
+        entry: MemoryEntry, content: str, content_label: str = "Content"
+    ) -> List[str]:
+        """Render shared entry metadata without changing the evidence set."""
+        parts = [f"{content_label}: {content}"]
+
+        if entry.timestamp:
+            parts.append(f"Time: {entry.timestamp}")
+
+        if entry.location:
+            parts.append(f"Location: {entry.location}")
+
+        if entry.persons:
+            parts.append(f"Persons: {', '.join(entry.persons)}")
+
+        if entry.entities:
+            parts.append(f"Related Entities: {', '.join(entry.entities)}")
+
+        if entry.topic:
+            parts.append(f"Topic: {entry.topic}")
+
+        return parts
+
+    def _render_entry(
+        self,
+        entry: MemoryEntry,
+        heading: str,
+        annotations: Dict[str, str],
+        content_label: str = "Content",
+    ) -> str:
+        """Render one retrieved entry while retaining chain annotations."""
+        content = entry.lossless_restatement
+        annotation = annotations.get(entry.entry_id)
+        if annotation:
+            content = f"{content} {annotation}"
+        return "\n".join(
+            [heading, *self._entry_details(entry, content, content_label)]
+        )
+
+    def _format_thread_evidence_contexts(
+        self, contexts: List[MemoryEntry], annotations: Dict[str, str]
+    ) -> str:
+        """Group retrieved thread summaries beside their retrieved fact evidence.
+
+        The renderer only states the persisted shared ``thread_id`` relation. It
+        keeps every retrieved entry and makes no claim that an unretrieved fact
+        supports a summary.
+        """
+        summaries = [entry for entry in contexts if entry.kind == KIND_THREAD_SUMMARY]
+        summary_thread_ids = {
+            entry.thread_id for entry in summaries if entry.thread_id
+        }
+        facts = [entry for entry in contexts if entry.kind == KIND_FACT]
+
+        current_supporting = [
+            entry
+            for entry in facts
+            if entry.thread_id in summary_thread_ids and entry.is_open
+        ]
+        historical_supporting = [
+            entry
+            for entry in facts
+            if entry.thread_id in summary_thread_ids and not entry.is_open
+        ]
+        other_facts = [
+            entry for entry in facts if entry.thread_id not in summary_thread_ids
+        ]
+        other_entries = [
+            entry
+            for entry in contexts
+            if entry.kind not in {KIND_THREAD_SUMMARY, KIND_FACT}
+        ]
+
+        sections: List[str] = []
+        if summaries:
+            summary_blocks = []
+            for index, entry in enumerate(summaries, 1):
+                thread_label = entry.thread_id or f"summary-{index}"
+                summary_blocks.append(
+                    self._render_entry(
+                        entry,
+                        f"[Thread {thread_label}]",
+                        annotations,
+                        content_label="Summary",
+                    )
+                )
+            sections.append("[Thread Summaries]\n" + "\n\n".join(summary_blocks))
+
+        def render_facts(
+            facts_to_render: List[MemoryEntry],
+            section_name: str,
+            historical: bool,
+            supports_summary: bool,
+        ) -> None:
+            if not facts_to_render:
+                return
+            fact_blocks = []
+            for index, entry in enumerate(facts_to_render, 1):
+                state = "current"
+                if historical:
+                    state = f"historical, superseded on {entry.valid_until}"
+                relation = ""
+                if supports_summary:
+                    relation = f" | supports Thread {entry.thread_id}"
+                fact_blocks.append(
+                    self._render_entry(
+                        entry,
+                        f"[Fact {index} | thread={entry.thread_id or 'unassigned'} | "
+                        f"{state}{relation}]",
+                        annotations,
+                    )
+                )
+            sections.append(f"[{section_name}]\n" + "\n\n".join(fact_blocks))
+
+        render_facts(
+            current_supporting,
+            "Supporting Facts",
+            historical=False,
+            supports_summary=True,
+        )
+        render_facts(
+            historical_supporting,
+            "Historical or Linked Facts",
+            historical=True,
+            supports_summary=True,
+        )
+        render_facts(
+            other_facts,
+            "Other Retrieved Facts",
+            historical=False,
+            supports_summary=False,
+        )
+
+        if other_entries:
+            entry_blocks = [
+                self._render_entry(entry, f"[Context {index}]", annotations)
+                for index, entry in enumerate(other_entries, 1)
+            ]
+            sections.append("[Other Retrieved Context]\n" + "\n\n".join(entry_blocks))
+
+        return "\n\n".join(sections)
+
+    def _format_contexts(self, contexts: List[MemoryEntry]) -> str:
+        """Format contexts for answer generation without changing retrieval."""
+        contexts, annotations = self._prepare_contexts(contexts)
+        if self.enable_thread_evidence_crosscheck:
+            return self._format_thread_evidence_contexts(contexts, annotations)
 
         formatted = []
         for i, entry in enumerate(contexts, 1):
-            parts = [f"[Context {i}]"]
-            content = entry.lossless_restatement
-            annotation = annotations.get(entry.entry_id)
-            if annotation:
-                content = f"{content} {annotation}"
-            parts.append(f"Content: {content}")
-
-            if entry.timestamp:
-                parts.append(f"Time: {entry.timestamp}")
-
-            if entry.location:
-                parts.append(f"Location: {entry.location}")
-
-            if entry.persons:
-                parts.append(f"Persons: {', '.join(entry.persons)}")
-
-            if entry.entities:
-                parts.append(f"Related Entities: {', '.join(entry.entities)}")
-
-            if entry.topic:
-                parts.append(f"Topic: {entry.topic}")
-
-            formatted.append("\n".join(parts))
+            formatted.append(
+                self._render_entry(entry, f"[Context {i}]", annotations)
+            )
 
         return "\n\n".join(formatted)
 
@@ -201,6 +356,16 @@ class AnswerGenerator:
         """
         Build answer generation prompt
         """
+        crosscheck_requirements = ""
+        if self.enable_thread_evidence_crosscheck:
+            crosscheck_requirements = """
+6. Thread summaries are compressed orientation only.
+7. A \"supports Thread <id>\" label identifies facts from the same memory thread.
+8. Verify every state claimed by a thread summary against its supporting facts.
+9. If a summary conflicts with any supporting fact, use the fact.
+10. For historical questions, respect the fact validity interval and supersede markers.
+11. Do not infer details that are absent from the supporting facts.
+"""
         return f"""
 Answer the user's question based on the provided context.
 
@@ -215,6 +380,7 @@ Requirements:
 3. Answer must be based ONLY on the provided context
 4. All dates in the response must be formatted as 'DD Month YYYY' but you can output more or less details if needed
 5. Return your response in JSON format
+{crosscheck_requirements}
 
 Output Format:
 ```json

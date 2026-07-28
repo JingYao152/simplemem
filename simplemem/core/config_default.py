@@ -134,6 +134,10 @@ ENABLE_SWEEP = True
 # embeddings, which is the P1 ablation.
 ENABLE_RECONTEXT = True
 
+# Dual-view state-anchor embeddings reserve the primary vector index for bare
+# facts and materialize a second, versioned index from persisted state fields.
+ENABLE_DUAL_VIEW_STATE_ANCHORS = False
+
 # P1: person-level living profiles (profile::<speaker>) in the retrieval pool,
 # built by deterministic code from the threads a speaker takes part in.
 ENABLE_ENTITY_PROFILES = True
@@ -207,4 +211,3 @@ JUDGE_TEMPERATURE = 0.3
 # 3. Use Qwen for judge (if available):
 #    JUDGE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 #    JUDGE_MODEL = "qwen-plus-2025-09-11"
-

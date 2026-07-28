@@ -114,12 +114,20 @@ class ScriptedLLM:
     _clean_json_string = LLMClient._clean_json_string
     _extract_balanced_json = LLMClient._extract_balanced_json
 
-    def __init__(self, assignment=None, thread_update=None, sweep=None, extraction=None):
+    def __init__(
+        self,
+        assignment=None,
+        thread_update=None,
+        sweep=None,
+        extraction=None,
+        repair=None,
+    ):
         self.scripts = {
             "assignment": list(assignment or []),
             "thread_update": list(thread_update or []),
             "sweep": list(sweep or []),
             "extraction": list(extraction or []),
+            "repair": list(repair or []),
         }
         self.prompts = {key: [] for key in self.scripts}
         self.temperatures = []
@@ -149,6 +157,8 @@ class ScriptedLLM:
             return "assignment"
         if "[Pairs]" in prompt:
             return "sweep"
+        if "[Coverage debt]" in prompt:
+            return "repair"
         if "[Thread]" in prompt:
             return "thread_update"
         return "extraction"
@@ -175,13 +185,20 @@ def assignment(*groups):
     ]})
 
 
-def thread_update(facts, summary="Thread summary", impact="major", outdated=None):
+def thread_update(
+    facts,
+    summary="Thread summary",
+    impact="major",
+    outdated=None,
+    exempt_turn_ids=None,
+):
     return json.dumps(
         {
             "facts": facts,
             "summary": summary,
             "summary_impact": impact,
             "outdated_facts": outdated or [],
+            "exempt_turn_ids": exempt_turn_ids or [],
         }
     )
 
@@ -196,8 +213,18 @@ def fact(restatement, op="none", target=None, **kwargs):
         "entities": kwargs.get("entities", []),
         "topic": kwargs.get("topic", "topic"),
         "weave": {"op": op, "target": target},
+        "source_turn_ids": kwargs.get("source_turn_ids", []),
     }
     return payload
+
+
+def repair_update(facts, exempt_turn_ids=None):
+    return json.dumps(
+        {
+            "facts": facts,
+            "exempt_turn_ids": exempt_turn_ids or [],
+        }
+    )
 
 
 def turns(session_stamp, *texts, start=1, speaker="Alice"):
@@ -316,6 +343,77 @@ def test_debt_store_survives_reopen(tmp_path):
 
     reopened = CoverageDebtStore(str(path))
     assert reopened.pending()[0].debt_id == debt.debt_id
+
+
+def test_coverage_scheduler_records_unmapped_turn_after_call_b(store, tmp_path):
+    from simplemem.core.memweaver.coverage import CoverageDebtStore
+
+    llm = ScriptedLLM(
+        assignment=[assignment(([1, 2], "new:Coffee"))],
+        thread_update=[
+            thread_update(
+                [fact("Alice drinks coffee.", source_turn_ids=[1])]
+            )
+        ],
+    )
+    debt_store = CoverageDebtStore(str(tmp_path / "debts.json"))
+    weaver = build_weaver(
+        store,
+        llm,
+        enable_coverage_debt_scheduler=True,
+        coverage_debt_store=debt_store,
+    )
+
+    weaver.add_dialogues(
+        turns("1:00 pm on 1 May, 2023", "coffee", "oat milk")
+    )
+    weaver.process_remaining()
+
+    debt = debt_store.pending()[0]
+    assert [turn.dialogue_id for turn in debt.source_turns] == [2]
+    assert weaver.stats["coverage_debts_created"] == 1
+
+
+def test_related_later_session_repairs_existing_debt(store, tmp_path):
+    from simplemem.core.memweaver.coverage import CoverageDebtStore
+
+    llm = ScriptedLLM(
+        assignment=[
+            assignment(([1, 2], "new:Coffee")),
+            assignment(([3], "existing:t1")),
+        ],
+        thread_update=[
+            thread_update(
+                [fact("Alice drinks coffee.", source_turn_ids=[1])]
+            ),
+            thread_update(
+                [fact("Alice visits a cafe.", source_turn_ids=[3])]
+            ),
+        ],
+        repair=[
+            repair_update(
+                [fact("Alice prefers oat milk.", source_turn_ids=[2])]
+            )
+        ],
+    )
+    debt_store = CoverageDebtStore(str(tmp_path / "debts.json"))
+    weaver = build_weaver(
+        store,
+        llm,
+        enable_coverage_debt_scheduler=True,
+        coverage_debt_store=debt_store,
+    )
+
+    weaver.add_dialogues(
+        turns("1:00 pm on 1 May, 2023", "coffee", "oat milk")
+    )
+    weaver.add_dialogues(
+        turns("1:00 pm on 8 May, 2023", "cafe", start=3)
+    )
+    weaver.process_remaining()
+
+    assert by_text(store, "Alice prefers oat milk.").source_turn_ids == [2]
+    assert debt_store.pending() == []
 
 
 def test_weave_targets_reads_typed_edges():

@@ -39,6 +39,14 @@ def format_turns(turns: Sequence) -> str:
     )
 
 
+def format_source_turns(turns: Sequence) -> str:
+    """Render turns with their stable ``Dialogue.dialogue_id`` values."""
+    return "\n".join(
+        f"{turn.dialogue_id}. [{turn.speaker}] {turn.content}"
+        for turn in turns
+    )
+
+
 def format_fact_candidates(facts: Sequence[MemoryEntry]) -> str:
     """Number a thread's existing facts 1..m as weave candidates."""
     if not facts:
@@ -116,7 +124,7 @@ Current summary: {thread_summary or "(no summary yet - this thread is new)"}
 {format_fact_candidates(candidates)}
 
 [New turns assigned to this thread]
-{format_turns(turns)}
+{format_source_turns(turns)}
 
 [Fact extraction requirements]
 1. **Complete Coverage**: Generate enough facts to ensure ALL information in the
@@ -131,6 +139,10 @@ Current summary: {thread_summary or "(no summary yet - this thread is new)"}
 4. **Precise Extraction**: keywords (names, places, entities, topic words),
    timestamp (ISO 8601, only when the dialogue states a time), location,
    persons, entities, topic.
+5. **Source Coverage**: Every fact must list the exact turn numbers above that
+   support it. Every turn that contains only greeting, acknowledgement, or
+   repeated confirmation must appear in exempt_turn_ids. Do not exempt a turn
+   that introduces a preference, event, plan, state, or other factual detail.
 
 [Weaving - how each new fact relates to an existing candidate]
 - "supersede": the new fact replaces a candidate that is no longer true
@@ -162,12 +174,72 @@ longer matches the rewritten summary.
       "persons": ["name1"],
       "entities": ["entity1"],
       "topic": "topic phrase",
+      "source_turn_ids": [12],
       "weave": {{"op": "none|supersede|refine|bridge", "target": null}}
     }}
   ],
   "summary": "rewritten thread summary",
   "summary_impact": "none|minor|major",
-  "outdated_facts": []
+  "outdated_facts": [],
+  "exempt_turn_ids": []
+}}
+```
+
+Return ONLY the JSON, no other explanations.
+"""
+
+
+def build_coverage_repair_prompt(
+    source_turns: Sequence,
+    nearby_turns: Sequence,
+    session_date: str,
+    thread_title: str,
+    thread_summary: str,
+    related_facts: Sequence[MemoryEntry],
+) -> str:
+    """Build a small repair request for one unresolved coverage debt."""
+    facts = format_fact_candidates(related_facts)
+    nearby = format_source_turns(nearby_turns) if nearby_turns else "(none)"
+    return f"""Repair one unresolved gap in a conversation memory.
+
+[Coverage debt]
+Session date: {session_date or "an unknown date"}
+Thread title: {thread_title or "(unknown thread)"}
+Thread summary: {thread_summary or "(no summary)"}
+
+[Uncovered source turns]
+{format_source_turns(source_turns)}
+
+[Nearby context]
+{nearby}
+
+[Related facts already stored]
+{facts}
+
+[Rules]
+1. Extract only facts supported by the uncovered source turns.
+2. Each fact must be self-contained, resolve names and relative time, and list
+   the supporting source_turn_ids from the uncovered source turns.
+3. Use exempt_turn_ids only for greetings, acknowledgements, or repeated
+   confirmations that contain no factual information.
+4. Do not rewrite the thread summary and do not propose weave relations.
+
+[Output Format]
+```json
+{{
+  "facts": [
+    {{
+      "lossless_restatement": "Complete unambiguous restatement",
+      "keywords": ["keyword1"],
+      "timestamp": "YYYY-MM-DDTHH:MM:SS or null",
+      "location": "location name or null",
+      "persons": ["name1"],
+      "entities": ["entity1"],
+      "topic": "topic phrase",
+      "source_turn_ids": [12]
+    }}
+  ],
+  "exempt_turn_ids": []
 }}
 ```
 

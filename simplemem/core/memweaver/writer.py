@@ -23,6 +23,7 @@ is recorded in :attr:`MemWeaver.stats` as a system health indicator.
 
 import concurrent.futures
 from dataclasses import dataclass, field
+from pathlib import Path
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -32,6 +33,11 @@ from simplemem.core.memweaver.context import (
     context_digest,
     context_prefix,
     contextual_embed_text,
+)
+from simplemem.core.memweaver.coverage import (
+    CoverageDebt,
+    CoverageDebtStore,
+    audit_turn_coverage,
 )
 from simplemem.core.memweaver.dual_view import (
     state_anchor_digest,
@@ -52,6 +58,7 @@ from simplemem.core.memweaver.prompts import (
     ASSIGNMENT_SYSTEM_PROMPT,
     EXTRACTION_SYSTEM_PROMPT,
     SWEEP_SYSTEM_PROMPT,
+    build_coverage_repair_prompt,
     build_sweep_prompt,
     build_thread_assignment_prompt,
     build_thread_update_prompt,
@@ -104,6 +111,7 @@ class ThreadUpdate:
     summary: str = ""
     summary_impact: str = "none"
     outdated_facts: List[int] = field(default_factory=list)
+    exempt_turn_ids: List[int] = field(default_factory=list)
     used_fallback: bool = False
 
 
@@ -129,6 +137,8 @@ class MemWeaver:
         enable_entity_profiles: Optional[bool] = None,
         state_anchor_store: Optional[VectorStore] = None,
         enable_dual_view_state_anchors: Optional[bool] = None,
+        enable_coverage_debt_scheduler: Optional[bool] = None,
+        coverage_debt_store: Optional[CoverageDebtStore] = None,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
@@ -175,6 +185,17 @@ class MemWeaver:
             if enable_entity_profiles is not None
             else getattr(config, "ENABLE_ENTITY_PROFILES", True)
         )
+        self.enable_coverage_debt_scheduler = (
+            enable_coverage_debt_scheduler
+            if enable_coverage_debt_scheduler is not None
+            else getattr(config, "ENABLE_COVERAGE_DEBT_SCHEDULER", False)
+        )
+        self.coverage_debt_store = coverage_debt_store
+        if self.enable_coverage_debt_scheduler and self.coverage_debt_store is None:
+            debt_path = Path(self.vector_store.db_path) / (
+                f"{self.vector_store.table_name}_coverage_debts.json"
+            )
+            self.coverage_debt_store = CoverageDebtStore(str(debt_path))
         self.max_parallel_workers = (
             max_parallel_workers
             if max_parallel_workers is not None
@@ -226,6 +247,17 @@ class MemWeaver:
             "sweep_unordered_pairs": 0,
             "sweep_parse_failures": 0,
         }
+        if self.enable_coverage_debt_scheduler:
+            self.stats.update(
+                {
+                    "coverage_debts_created": 0,
+                    "coverage_repair_attempts": 0,
+                    "coverage_repair_failures": 0,
+                    "coverage_debts_repaired": 0,
+                    "coverage_debts_exempted": 0,
+                    "coverage_facts_repaired": 0,
+                }
+            )
 
     # ------------------------------------------------------------------
     # Ingestion surface (mirrors MemoryBuilder)
@@ -257,6 +289,9 @@ class MemWeaver:
     def finalize(self) -> None:
         """Flush the buffer, run the cross-thread sweep, optimize the store."""
         self.process_remaining()
+
+        if self.enable_coverage_debt_scheduler and self.coverage_debt_store:
+            self._repair_debts(self.coverage_debt_store.pending(), "")
 
         if self.enable_sweep:
             self._cross_thread_sweep()
@@ -342,12 +377,198 @@ class MemWeaver:
                 for a in assignments
             )
         )
+        repair_debts = self._related_debts(assignments)
 
         updates = self._run_thread_updates(assignments, snapshot, session_date)
         self._apply_session(
             assignments, updates, snapshot, session_date, session_datetime
         )
+        self._audit_coverage(assignments, updates, session_date)
+        self._repair_debts(repair_debts, session_date)
         self.processed_count += len(turns)
+
+    # ------------------------------------------------------------------
+    # Coverage debts - source-turn audit and deferred repair
+    # ------------------------------------------------------------------
+
+    def _related_debts(
+        self,
+        assignments: Sequence[ThreadAssignment],
+    ) -> List[CoverageDebt]:
+        if not self.enable_coverage_debt_scheduler or self.coverage_debt_store is None:
+            return []
+
+        thread_ids = [assignment.thread_id for assignment in assignments]
+        entities = [
+            turn.speaker
+            for assignment in assignments
+            for turn in assignment.turns
+            if turn.speaker
+        ]
+        return self.coverage_debt_store.pending_related(thread_ids, entities)
+
+    def _audit_coverage(
+        self,
+        assignments: Sequence[ThreadAssignment],
+        updates: Sequence[ThreadUpdate],
+        session_date: str,
+    ) -> None:
+        if not self.enable_coverage_debt_scheduler or self.coverage_debt_store is None:
+            return
+
+        for assignment, update in zip(assignments, updates):
+            uncovered = audit_turn_coverage(
+                assignment.turns,
+                update.facts,
+                update.exempt_turn_ids,
+            )
+            if not uncovered:
+                continue
+
+            entities = _unique_strings(
+                [
+                    name
+                    for fact in update.facts
+                    for name in [*fact.persons, *fact.entities]
+                ]
+                + [turn.speaker for turn in assignment.turns if turn.speaker]
+            )
+            for turn in uncovered:
+                nearby_turns = [
+                    candidate
+                    for candidate in assignment.turns
+                    if candidate.dialogue_id != turn.dialogue_id
+                ]
+                self.coverage_debt_store.record(
+                    session_id=session_date,
+                    thread_id=assignment.thread_id,
+                    source_turns=[turn],
+                    nearby_turns=nearby_turns,
+                    entities=entities,
+                    topic=assignment.title,
+                )
+                self._bump("coverage_debts_created")
+
+    def _repair_debts(
+        self,
+        debts: Sequence[CoverageDebt],
+        session_date: str,
+    ) -> None:
+        if not self.enable_coverage_debt_scheduler or self.coverage_debt_store is None:
+            return
+
+        for debt in debts:
+            try:
+                self._repair_debt(debt, session_date)
+            except Exception as error:
+                self.coverage_debt_store.increment_attempt(debt.debt_id)
+                self._bump("coverage_repair_failures")
+                print(
+                    f"[MemWeaver] coverage repair failed for {debt.debt_id}: "
+                    f"{error}"
+                )
+
+    def _repair_debt(self, debt: CoverageDebt, session_date: str) -> None:
+        if self.coverage_debt_store is None:
+            return
+
+        self._bump("coverage_repair_attempts")
+        snapshot = load_fabric(self.vector_store)
+        thread = snapshot.threads.get(
+            debt.thread_id,
+            ThreadState(thread_id=debt.thread_id, title=debt.topic, summary=""),
+        )
+        candidates = self._related_facts(snapshot.facts(debt.thread_id), debt.entities)
+        prompt = build_coverage_repair_prompt(
+            source_turns=debt.source_turns,
+            nearby_turns=debt.nearby_turns,
+            session_date=debt.session_id or session_date,
+            thread_title=thread.title or debt.topic,
+            thread_summary=thread.summary,
+            related_facts=candidates,
+        )
+        response = self._chat(prompt, EXTRACTION_SYSTEM_PROMPT)
+        data = self.llm_client.extract_json(response)
+        if not isinstance(data, dict):
+            raise ValueError(f"Coverage repair expected JSON object, got {type(data)}")
+
+        allowed_ids = {turn.dialogue_id for turn in debt.source_turns}
+        raw_facts = data.get("facts")
+        if not isinstance(raw_facts, list):
+            raise ValueError("Coverage repair output has no 'facts' array")
+
+        facts = [
+            fact
+            for item in raw_facts
+            if isinstance(item, dict)
+            for fact in [
+                self._parse_fact_item(
+                    item,
+                    thread_id=debt.thread_id,
+                    session_date=debt.session_id or session_date,
+                    allowed_source_turn_ids=allowed_ids,
+                )
+            ]
+            if fact is not None and fact.source_turn_ids
+        ]
+        exempt_ids = {
+            turn_id
+            for turn_id in _int_list(data.get("exempt_turn_ids"))
+            if turn_id in allowed_ids
+        }
+
+        covered_ids = {
+            turn_id for fact in facts for turn_id in fact.source_turn_ids
+        }
+        if facts:
+            prefix = (
+                context_prefix(thread.summary, thread.title)
+                if self.enable_recontext
+                else ""
+            )
+            digest = context_digest(prefix)
+            for fact in facts:
+                fact.context_digest = digest
+            self.vector_store.add_entries(
+                facts,
+                embed_texts=[
+                    contextual_embed_text(prefix, fact.lossless_restatement)
+                    for fact in facts
+                ],
+            )
+            self._bump("facts_written", len(facts))
+            self._bump("coverage_facts_repaired", len(facts))
+
+        if allowed_ids.issubset(covered_ids):
+            self.coverage_debt_store.mark_repaired(
+                debt.debt_id,
+                [fact.entry_id for fact in facts],
+            )
+            self._bump("coverage_debts_repaired")
+        elif allowed_ids.issubset(exempt_ids):
+            self.coverage_debt_store.mark_exempt(debt.debt_id)
+            self._bump("coverage_debts_exempted")
+        else:
+            self.coverage_debt_store.increment_attempt(debt.debt_id)
+
+    @staticmethod
+    def _related_facts(
+        facts: Sequence[MemoryEntry],
+        entities: Sequence[str],
+    ) -> List[MemoryEntry]:
+        entity_set = {entity.casefold() for entity in entities if entity}
+        if not entity_set:
+            return []
+        return [
+            fact
+            for fact in facts
+            if entity_set
+            & {
+                entity.casefold()
+                for entity in [*fact.persons, *fact.entities]
+                if entity
+            }
+        ]
 
     # ------------------------------------------------------------------
     # Call A - thread assignment
@@ -599,30 +820,21 @@ class MemWeaver:
             raise ValueError("Call B output has no 'facts' array")
 
         update = ThreadUpdate()
+        allowed_source_turn_ids = {
+            turn.dialogue_id for turn in assignment.turns
+        }
         for item in raw_facts:
             if not isinstance(item, dict):
                 continue
-            restatement = item.get("lossless_restatement")
-            if not isinstance(restatement, str) or not restatement.strip():
-                continue
-
-            timestamp = item.get("timestamp")
-            timestamp = timestamp if isinstance(timestamp, str) and timestamp else None
-            update.facts.append(
-                MemoryEntry(
-                    lossless_restatement=restatement.strip(),
-                    keywords=_string_list(item.get("keywords")),
-                    timestamp=timestamp,
-                    location=item.get("location") if isinstance(item.get("location"), str) else None,
-                    persons=_string_list(item.get("persons")),
-                    entities=_string_list(item.get("entities")),
-                    topic=item.get("topic") if isinstance(item.get("topic"), str) else None,
-                    kind=KIND_FACT,
-                    thread_id=assignment.thread_id,
-                    # Fact's own timestamp when it has one, else the session date.
-                    valid_from=to_day(timestamp) or session_date,
-                )
+            fact = self._parse_fact_item(
+                item,
+                thread_id=assignment.thread_id,
+                session_date=session_date,
+                allowed_source_turn_ids=allowed_source_turn_ids,
             )
+            if fact is None:
+                continue
+            update.facts.append(fact)
             update.weaves.append(self._parse_weave(item.get("weave"), candidates))
 
         summary = data.get("summary")
@@ -636,7 +848,47 @@ class MemWeaver:
             for index in _int_list(data.get("outdated_facts"))
             if 1 <= index <= len(candidates)
         ]
+        update.exempt_turn_ids = [
+            turn_id
+            for turn_id in _int_list(data.get("exempt_turn_ids"))
+            if turn_id in allowed_source_turn_ids
+        ]
         return update
+
+    @staticmethod
+    def _parse_fact_item(
+        item: Dict[str, Any],
+        *,
+        thread_id: str,
+        session_date: str,
+        allowed_source_turn_ids: Sequence[int],
+    ) -> Optional[MemoryEntry]:
+        restatement = item.get("lossless_restatement")
+        if not isinstance(restatement, str) or not restatement.strip():
+            return None
+
+        allowed_ids = set(allowed_source_turn_ids)
+        source_turn_ids = [
+            turn_id
+            for turn_id in dict.fromkeys(_int_list(item.get("source_turn_ids")))
+            if turn_id in allowed_ids
+        ]
+        timestamp = item.get("timestamp")
+        timestamp = timestamp if isinstance(timestamp, str) and timestamp else None
+        return MemoryEntry(
+            lossless_restatement=restatement.strip(),
+            keywords=_string_list(item.get("keywords")),
+            timestamp=timestamp,
+            location=item.get("location") if isinstance(item.get("location"), str) else None,
+            persons=_string_list(item.get("persons")),
+            entities=_string_list(item.get("entities")),
+            topic=item.get("topic") if isinstance(item.get("topic"), str) else None,
+            kind=KIND_FACT,
+            thread_id=thread_id,
+            # Fact's own timestamp when it has one, else the session date.
+            valid_from=to_day(timestamp) or session_date,
+            source_turn_ids=source_turn_ids,
+        )
 
     def _parse_weave(
         self,
@@ -1194,6 +1446,18 @@ def _string_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _unique_strings(values: Sequence[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        normalized = value.strip()
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            seen.add(key)
+            result.append(normalized)
+    return result
 
 
 def _int_list(value: Any) -> List[int]:

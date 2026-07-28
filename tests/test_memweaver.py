@@ -280,6 +280,44 @@ def test_source_turn_ids_roundtrip_through_vector_store(store):
     assert restored.source_turn_ids == [7, 9]
 
 
+def test_coverage_audit_returns_only_unmapped_non_exempt_turns():
+    from simplemem.core.memweaver.coverage import audit_turn_coverage
+
+    source = turns(
+        "1:00 pm on 1 May, 2023",
+        "coffee",
+        "okay",
+        "oat milk",
+        start=11,
+    )
+    fact_entry = MemoryEntry(
+        lossless_restatement="Alice drinks coffee.",
+        source_turn_ids=[11],
+    )
+
+    uncovered = audit_turn_coverage(source, [fact_entry], exempt_turn_ids=[12])
+
+    assert [turn.dialogue_id for turn in uncovered] == [13]
+
+
+def test_debt_store_survives_reopen(tmp_path):
+    from simplemem.core.memweaver.coverage import CoverageDebtStore
+
+    path = tmp_path / "coverage-debts.json"
+    store = CoverageDebtStore(str(path))
+    debt = store.record(
+        session_id="2023-05-01",
+        thread_id="t1",
+        source_turns=turns("2023-05-01T13:00:00", "coffee", start=11),
+        nearby_turns=[],
+        entities=["Alice"],
+        topic="Coffee",
+    )
+
+    reopened = CoverageDebtStore(str(path))
+    assert reopened.pending()[0].debt_id == debt.debt_id
+
+
 def test_weave_targets_reads_typed_edges():
     entry = MemoryEntry(
         lossless_restatement="x",

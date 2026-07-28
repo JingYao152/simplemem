@@ -2,6 +2,7 @@
 LLM Client - Handles all LLM interactions
 """
 import json
+import os
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 from simplemem.core.settings import settings as config
@@ -31,14 +32,17 @@ class LLMClient:
             client_kwargs["base_url"] = self.base_url
             print(f"Using custom OpenAI base URL: {self.base_url}")
 
+        timeout_value = os.getenv("OPENAI_TIMEOUT")
+        if timeout_value:
+            timeout = float(timeout_value)
+            if timeout <= 0:
+                raise ValueError("OPENAI_TIMEOUT must be positive")
+            client_kwargs["timeout"] = timeout
+
         if self.enable_thinking:
             print(f"Deep thinking mode enabled")
 
-        # self.client = OpenAI(**client_kwargs)
-        self.client = OpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key,
-        )
+        self.client = OpenAI(**client_kwargs)
 
     def chat_completion(
         self,

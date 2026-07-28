@@ -213,6 +213,7 @@ class LanceDBVectorStoreBackend:
                 pa.field("superseded_by", pa.string()),
                 pa.field("links", pa.list_(pa.string())),
                 pa.field("context_digest", pa.string()),
+                pa.field("source_turn_ids", pa.list_(pa.int64())),
                 pa.field(
                     "vector",
                     pa.list_(pa.float32(), self.vector_dimension),

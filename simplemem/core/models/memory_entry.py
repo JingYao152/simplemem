@@ -103,6 +103,10 @@ class MemoryEntry(BaseModel):
         description="Fingerprint of the thread summary used at embedding time "
                     "(P1 re-contextualization)"
     )
+    source_turn_ids: List[int] = Field(
+        default_factory=list,
+        description="Dialogue ids in the source session that support this fact"
+    )
 
     @staticmethod
     def thread_summary_id(thread_id: str) -> str:

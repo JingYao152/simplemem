@@ -267,6 +267,19 @@ def test_entry_defaults_keep_pure_simplemem_entries_valid():
     assert MemoryEntry.entity_profile_id("Melanie") == "profile::Melanie"
 
 
+def test_source_turn_ids_roundtrip_through_vector_store(store):
+    entry = MemoryEntry(
+        entry_id="source-fact",
+        lossless_restatement="Alice drinks oat milk coffee.",
+        source_turn_ids=[7, 9],
+    )
+
+    store.add_entries([entry])
+
+    restored = store.get_by_ids(["source-fact"])[0]
+    assert restored.source_turn_ids == [7, 9]
+
+
 def test_weave_targets_reads_typed_edges():
     entry = MemoryEntry(
         lossless_restatement="x",

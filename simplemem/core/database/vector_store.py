@@ -36,6 +36,7 @@ class VectorStore:
             "superseded_by",
             "links",
             "context_digest",
+            "source_turn_ids",
         }
     )
 
@@ -315,6 +316,7 @@ class VectorStore:
             "superseded_by": entry.superseded_by or "",
             "links": entry.links,
             "context_digest": entry.context_digest or "",
+            "source_turn_ids": entry.source_turn_ids,
         }
 
     @staticmethod
@@ -342,6 +344,7 @@ class VectorStore:
                         superseded_by=metadata.get("superseded_by") or "",
                         links=list(metadata.get("links") or []),
                         context_digest=metadata.get("context_digest") or "",
+                        source_turn_ids=list(metadata.get("source_turn_ids") or []),
                     )
                 )
             except Exception as error:

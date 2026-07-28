@@ -72,11 +72,21 @@ Session 边界由数据自带（Dialogue.timestamp 变化即切换）。实测�
   输出:  {
            facts: [{restatement, keywords, timestamp, location, persons,
                     entities, topic,
+                    source_turn_ids: [来源 dialogue_id...],
                     weave: {op: none|supersede|refine|bridge, target: 候选编号}}],
            summary: "重写后的线程摘要",
            summary_impact: "none" | "minor" | "major",
-           outdated_facts: [候选编号...]      // P1 重上下文化的语义触发信号
+           outdated_facts: [候选编号...],     // P1 重上下文化的语义触发信号
+           exempt_turn_ids: [仅寒暄/确认的 dialogue_id...]
          }
+
+  ── P3 覆盖债务审计（ENABLE_COVERAGE_DEBT_SCHEDULER）──
+  对每个被分配的 dialogue turn，检查其是否出现在任一 facts.source_turn_ids
+  或 exempt_turn_ids。缺失映射的内容性 turn 写入独立 CoverageDebt JSON
+  记录，保存原始 turn、相邻 turn、线程、实体与主题。债务不写入向量库。
+  后续会话再次触及同一线程或实体时，以债务 turn、相邻 turn 与相关事实
+  发起一次小范围补抽；finalize() 对剩余债务补抽一次。补抽成功的条目经
+  schema 校验后作为普通事实写入 Fabric，解析失败的债务保留 pending 状态。
 
   ── 编织执行（确定性代码，非 LLM）──
   supersede:  旧条目.valid_until = d; 旧条目.superseded_by = 新条目 id
@@ -185,6 +195,7 @@ STRUCTURED_TOP_K=5 / MAX_REFLECTION_ROUNDS=2），与 baseline 逐项相同，
 | P0 | 数据模型 + 后端三能力 + Call A/B 写管线 + supersede + as-of 检索 + 兜底扫描 | cat2 时间题(321) |
 | P1 | 上下文继承嵌入 + outdated_facts 重嵌入 + 实体档案入池 | cat1 单跳(282)、cat4 开放域(841) |
 | P2 | 一跳扩展 + 交叉编码器平铺精排 | cat3 多跳(96) + 全局 |
+| P3 | 事实来源映射 + 覆盖债务登记与延后补抽 | cat1 单跳、cat3 多跳的事实覆盖 |
 
 验证方法：每阶段同 harness A/B（test_locomo10.py）；另用 QA 的 evidence 字段
 直接量**检索命中率**（session/dia_id 级），不必等端到端分数。
@@ -192,6 +203,9 @@ STRUCTURED_TOP_K=5 / MAX_REFLECTION_ROUNDS=2），与 baseline 逐项相同，
 消融开关（config，每项对应论文消融表一行）：
 ENABLE_MEMWEAVER / ENABLE_WEAVING / ENABLE_SWEEP / ENABLE_RECONTEXT /
 ENABLE_EXPAND_RERANK（一跳扩展+精排整体开关）。
+P3 使用 `ENABLE_COVERAGE_DEBT_SCHEDULER`，默认关闭；债务记录保存在
+`<LANCEDB_PATH>/<MEMORY_TABLE_NAME>_coverage_debts.json`，不会进入语义、
+词法、符号检索或回答上下文。
 
 ## 9. 成本与风险
 

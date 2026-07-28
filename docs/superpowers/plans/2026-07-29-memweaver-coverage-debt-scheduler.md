@@ -39,7 +39,7 @@
 - Produces: `VectorStore.METADATA_FIELDS`、元数据序列化与反序列化包含 `source_turn_ids`
 - Produces: LanceDB 表新增 `source_turn_ids: list<int64>`，旧表迁移时以空列表填充
 
-- [ ] **Step 1: Write the failing source-persistence test**
+- [x] **Step 1: Write the failing source-persistence test**
 
 ```python
 def test_source_turn_ids_roundtrip_through_vector_store(store):
@@ -55,13 +55,13 @@ def test_source_turn_ids_roundtrip_through_vector_store(store):
     assert restored.source_turn_ids == [7, 9]
 ```
 
-- [ ] **Step 2: Run the focused test and verify the expected failure**
+- [x] **Step 2: Run the focused test and verify the expected failure**
 
 Run: `python -m pytest tests/test_memweaver.py::test_source_turn_ids_roundtrip_through_vector_store -q`
 
 Expected: FAIL because `MemoryEntry` has no `source_turn_ids` field or the field is discarded by storage.
 
-- [ ] **Step 3: Add the field and persistence mapping**
+- [x] **Step 3: Add the field and persistence mapping**
 
 ```python
 # MemoryEntry
@@ -76,13 +76,13 @@ source_turn_ids=list(metadata.get("source_turn_ids") or []),
 
 Add the corresponding `pa.field("source_turn_ids", pa.list_(pa.int64()))` to the LanceDB schema. In `_migrate_table`, add an empty list default for this list column so pre-existing rows remain readable.
 
-- [ ] **Step 4: Run the focused test and the storage subset**
+- [x] **Step 4: Run the focused test and the storage subset**
 
 Run: `python -m pytest tests/test_memweaver.py::test_source_turn_ids_roundtrip_through_vector_store tests/test_memweaver.py::test_lancedb_table_migrates_pre_memweaver_schema -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the source-provenance task**
+- [x] **Step 5: Commit the source-provenance task**
 
 ```bash
 git add simplemem/core/models/memory_entry.py simplemem/core/database/vector_store.py simplemem/core/database/vector_store_backend.py tests/test_memweaver.py
@@ -102,7 +102,7 @@ git commit -m "feat(memweaver): persist fact source turn ids"
 - Produces: `CoverageDebtStore(path: str)` with `record`, `pending`, `pending_related`, `mark_repaired`, `increment_attempt`, and `mark_exempt`
 - Produces: `audit_turn_coverage(turns, facts, exempt_turn_ids) -> List[Dialogue]`
 
-- [ ] **Step 1: Write the failing audit and persistence tests**
+- [x] **Step 1: Write the failing audit and persistence tests**
 
 ```python
 def test_coverage_audit_returns_only_unmapped_non_exempt_turns():
@@ -133,13 +133,13 @@ def test_debt_store_survives_reopen(tmp_path):
     assert reopened.pending()[0].debt_id == debt.debt_id
 ```
 
-- [ ] **Step 2: Run the focused tests and verify the expected failure**
+- [x] **Step 2: Run the focused tests and verify the expected failure**
 
 Run: `python -m pytest tests/test_memweaver.py::test_coverage_audit_returns_only_unmapped_non_exempt_turns tests/test_memweaver.py::test_debt_store_survives_reopen -q`
 
 Expected: FAIL because `coverage.py` and its public interfaces do not exist.
 
-- [ ] **Step 3: Implement the isolated coverage module**
+- [x] **Step 3: Implement the isolated coverage module**
 
 ```python
 @dataclass
@@ -158,13 +158,13 @@ class CoverageDebt:
 
 Serialize dialogue fields explicitly to JSON. Use a temporary sibling file and `Path.replace()` for atomic writes. Compute debt identity from session, thread and source dialogue identifiers so repeated audits update one record rather than creating duplicates.
 
-- [ ] **Step 4: Run the focused tests and the full coverage-module test selection**
+- [x] **Step 4: Run the focused tests and the full coverage-module test selection**
 
 Run: `python -m pytest tests/test_memweaver.py -q -k "coverage or debt or source_turn_ids"`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the debt-storage task**
+- [x] **Step 5: Commit the debt-storage task**
 
 ```bash
 git add simplemem/core/memweaver/coverage.py tests/test_memweaver.py
@@ -189,7 +189,7 @@ git commit -m "feat(memweaver): track persistent coverage debts"
 - Produces: `MemWeaver._repair_debts(debts: Sequence[CoverageDebt], session_date: str) -> None`
 - Produces: `MemWeaver._repair_debt(debt: CoverageDebt, session_date: str) -> None`
 
-- [ ] **Step 1: Write the failing integration tests**
+- [x] **Step 1: Write the failing integration tests**
 
 ```python
 def repair_update(facts, exempt_turn_ids=None):
@@ -254,31 +254,31 @@ def test_related_later_session_repairs_existing_debt(store, tmp_path):
     assert debt_store.pending() == []
 ```
 
-- [ ] **Step 2: Run the first integration test and verify the expected failure**
+- [x] **Step 2: Run the first integration test and verify the expected failure**
 
 Run: `python -m pytest tests/test_memweaver.py::test_coverage_scheduler_records_unmapped_turn_after_call_b -q`
 
 Expected: FAIL because Call B facts do not parse `source_turn_ids` and the scheduler interfaces do not exist.
 
-- [ ] **Step 3: Extend Call B parsing and prompts**
+- [x] **Step 3: Extend Call B parsing and prompts**
 
 Add `source_turn_ids` to every Call B fact JSON object and add a top-level `exempt_turn_ids` array. Render Call B turn labels from `Dialogue.dialogue_id`, validate all returned identifiers against the assigned turn set, and ignore invalid identifiers. Keep Call A numbering unchanged.
 
 Add `build_coverage_repair_prompt()` that renders only the debt source turns, nearby turns, session date and selected thread facts. Its output format contains `facts` and `exempt_turn_ids`; no summary rewrite or weave judgement is requested.
 
-- [ ] **Step 4: Implement scheduler hooks and repair writes**
+- [x] **Step 4: Implement scheduler hooks and repair writes**
 
 At the start of `_process_session`, select debts related to the current assignments. After `_apply_session`, audit current `ThreadUpdate` facts and record uncovered turn groups. Then repair only the debts selected before the current audit, so a newly created debt never blocks its source session.
 
 Repair facts must retain the debt thread id, use the repair source turn identifiers, receive the current thread context embedding prefix, and enter `VectorStore.add_entries()` as ordinary facts. A successful repair calls `mark_repaired`; an exception calls `increment_attempt`. `finalize()` repairs all remaining pending debts once before the sweep.
 
-- [ ] **Step 5: Run the scheduler integration selection**
+- [x] **Step 5: Run the scheduler integration selection**
 
 Run: `python -m pytest tests/test_memweaver.py -q -k "coverage_scheduler or repairs_existing_debt or source_turn_ids"`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the scheduler task**
+- [x] **Step 6: Commit the scheduler task**
 
 ```bash
 git add simplemem/core/memweaver/prompts.py simplemem/core/memweaver/writer.py simplemem/core/settings.py tests/test_memweaver.py
@@ -298,7 +298,7 @@ git commit -m "feat(memweaver): repair uncovered conversation turns"
 - Produces: documented environment switch `ENABLE_COVERAGE_DEBT_SCHEDULER`
 - Produces: specification fields that include persisted source and nearby dialogue content required for later repair
 
-- [ ] **Step 1: Write the failing default-off regression test**
+- [x] **Step 1: Write the failing default-off regression test**
 
 ```python
 def test_coverage_scheduler_is_disabled_by_default(store):
@@ -315,17 +315,17 @@ def test_coverage_scheduler_is_disabled_by_default(store):
     assert "coverage_debts_created" not in weaver.stats
 ```
 
-- [ ] **Step 2: Run the test and verify the expected failure before the default-off implementation exists**
+- [x] **Step 2: Run the test and verify the expected failure before the default-off implementation exists**
 
 Run: `python -m pytest tests/test_memweaver.py::test_coverage_scheduler_is_disabled_by_default -q`
 
 Expected: FAIL because `coverage_debt_store` does not exist on `MemWeaver`.
 
-- [ ] **Step 3: Finalize default-off behavior and documentation**
+- [x] **Step 3: Finalize default-off behavior and documentation**
 
 Set the settings default to `False`. Document the write-side position, debt-file location, repair trigger rules, source turn persistence and the fact that debts never enter retrieval. Update the specification to list serialized source and nearby dialogue content as persistence requirements.
 
-- [ ] **Step 4: Run focused and complete regression tests**
+- [x] **Step 4: Run focused and complete regression tests**
 
 Run: `python -m pytest tests/test_memweaver.py -q`
 
@@ -335,7 +335,7 @@ Run: `python -m pytest tests/test_api_key_rotation.py tests/test_memweaver.py -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit documentation and verification task**
+- [x] **Step 5: Commit documentation and verification task**
 
 ```bash
 git add docs/memweaver-design.md docs/superpowers/specs/2026-07-29-memweaver-coverage-debt-scheduler-design.md tests/test_memweaver.py

@@ -22,6 +22,8 @@ session_id:          来源会话标识
 thread_id:           Call A 分配后的所属线程标识
 source_turn_ids:     未被事实覆盖的 dialogue 编号
 nearby_turn_ids:     用于补抽的相邻上下文编号
+source_turns:        来源 dialogue 的编号、说话人、文本和时间戳
+nearby_turns:        相邻 dialogue 的编号、说话人、文本和时间戳
 entities:            已解析出的实体名
 topic:               会话或线程主题
 status:              pending | repaired | exempt
@@ -32,6 +34,8 @@ resolved_at:         修复或豁免时间
 ```
 
 `MemoryEntry` 新增 `source_turn_ids: List[int]`，使每条事实均可追溯到一条或多条原始对话轮。Call B 输出另含 `exempt_turn_ids: List[int]`，只允许标记寒暄、重复确认和无事实内容。覆盖审计以会话全部 turn 减去事实的 `source_turn_ids` 和 `exempt_turn_ids` 得到债务集合；模型解析失败时，全部未映射 turn 均进入债务集合。
+
+债务记录同时序列化来源与相邻 dialogue 的完整字段。后续补抽无法依赖短期内存或原始会话文件，因此必须从债务记录恢复文本上下文。
 
 ## 写入过程
 

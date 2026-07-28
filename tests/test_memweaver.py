@@ -416,6 +416,20 @@ def test_related_later_session_repairs_existing_debt(store, tmp_path):
     assert debt_store.pending() == []
 
 
+def test_coverage_scheduler_is_disabled_by_default(store):
+    llm = ScriptedLLM(
+        assignment=[assignment(([1], "new:Coffee"))],
+        thread_update=[thread_update([fact("Alice drinks coffee.")])],
+    )
+    weaver = build_weaver(store, llm)
+
+    weaver.add_dialogues(turns("1:00 pm on 1 May, 2023", "coffee"))
+    weaver.process_remaining()
+
+    assert weaver.coverage_debt_store is None
+    assert "coverage_debts_created" not in weaver.stats
+
+
 def test_weave_targets_reads_typed_edges():
     entry = MemoryEntry(
         lossless_restatement="x",

@@ -436,7 +436,9 @@ passed to the constructor. The variable name matches the `config.py` key:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | OpenAI-compatible API key | Required |
+| `OPENAI_API_KEYS` | Comma or newline separated API key pool; takes precedence over `OPENAI_API_KEY` | Empty |
 | `OPENAI_BASE_URL` | Custom API endpoint | None |
+| `OPENAI_KEY_COOLDOWN_SECONDS` | Temporary cooldown after an HTTP 429 response | `30` |
 | `LLM_MODEL` | LLM model name | `"gpt-4.1-mini"` |
 | `EMBEDDING_MODEL` | Embedding model | `"Qwen/Qwen3-Embedding-0.6B"` |
 | `EMBEDDING_DIMENSION` | Embedding dimension | `1024` |
@@ -447,6 +449,8 @@ Example `.env` file:
 
 ```bash
 OPENAI_API_KEY=sk-your-api-key
+# Optional: requests rotate through these keys. Keep keys out of version control.
+# OPENAI_API_KEYS=sk-key-1,sk-key-2
 OPENAI_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4.1-mini
 EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B

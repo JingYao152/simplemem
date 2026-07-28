@@ -388,8 +388,9 @@ def create_judge_llm_client():
     from simplemem.core.utils.llm_client import LLMClient
     from simplemem.core.settings import settings as config
 
-    # Use judge-specific settings, fall back to main settings if not specified
-    judge_api_key = getattr(config, 'JUDGE_API_KEY', None) or config.OPENAI_API_KEY
+    # A dedicated judge key remains fixed. Without one, LLMClient reads the
+    # shared OPENAI_API_KEYS pool before falling back to OPENAI_API_KEY.
+    judge_api_key = getattr(config, 'JUDGE_API_KEY', None)
     judge_base_url = getattr(config, 'JUDGE_BASE_URL', None)
     if judge_base_url is None:
         judge_base_url = getattr(config, 'OPENAI_BASE_URL', None)

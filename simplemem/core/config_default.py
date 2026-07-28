@@ -15,6 +15,13 @@ IMPORTANT:
 # Get your key from: https://platform.openai.com/api-keys
 OPENAI_API_KEY = "your-api-key-here"
 
+# Optional key pool for round-robin requests. Comma and newline separators are
+# supported. When this setting is empty, OPENAI_API_KEY remains the fallback.
+# OPENAI_API_KEYS = "your-api-key-1,your-api-key-2"
+
+# Seconds to temporarily skip a key after an HTTP 429 response.
+OPENAI_KEY_COOLDOWN_SECONDS = 30
+
 # Custom OpenAI Base URL (optional)
 # Set to None to use default OpenAI endpoint
 # Examples:

@@ -11,7 +11,9 @@ import os
 
 _DEFAULTS = {
     "OPENAI_API_KEY": "",
+    "OPENAI_API_KEYS": "",
     "OPENAI_BASE_URL": None,
+    "OPENAI_KEY_COOLDOWN_SECONDS": 30,
     "OPENROUTER_API_KEY": "",
     "OPENROUTER_BASE_URL": None,
     "LLM_MODEL": "gpt-4.1-mini",

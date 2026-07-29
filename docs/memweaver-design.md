@@ -150,6 +150,12 @@ anchor = 记忆库最大 session 日期        // LoCoMo 无 question_date → �
   bridge 事实与 query 直接相似度低（正是其未被检索命中的原因），
   裸文本精排会再次排掉它们；锚点候选自身裸文本打分
           ← 唯一保留的通用读侧组件（继承标注，不进贡献声明）
+→ 约束式证据织网（可选，ENABLE_CONSTRAINT_EVIDENCE_WEAVE）:
+  仅当规划结果含至少两个 non-low priority 的信息需求且最少检索数不少于 2 时启用。
+  在全候选精排后，为每个需求分配不同的主事实；主事实经 bridge/refine 扩展进入
+  候选池时，其锚点紧随保留。剩余固定预算优先填入来源 dialogue_id 尚未出现的事实，
+  再按全局精排顺序补齐。该组件不增加 LLM 调用，不写入新记忆字段，不读取评测 gold
+  evidence；关闭时保留原有平铺精排顺序。
 → 生成: SimpleMem 原生回答 prompt（不加题型格式化）；
         supersede 链成员相邻排布并标注:
         "[SUPERSEDED on <d> by Context N]"（时间题常问"之前是什么"）← C3
@@ -203,6 +209,9 @@ STRUCTURED_TOP_K=5 / MAX_REFLECTION_ROUNDS=2），与 baseline 逐项相同，
 消融开关（config，每项对应论文消融表一行）：
 ENABLE_MEMWEAVER / ENABLE_WEAVING / ENABLE_SWEEP / ENABLE_RECONTEXT /
 ENABLE_EXPAND_RERANK（一跳扩展+精排整体开关）。
+`ENABLE_CONSTRAINT_EVIDENCE_WEAVE` 是读取侧独立开关，默认关闭；它依赖
+MemWeaver 与精排，一跳扩展启用时额外保留 bridge/refine 锚点。与
+`ENABLE_REQUIREMENT_BUNDLES` 同时启用时，约束式证据织网优先执行。
 P3 使用 `ENABLE_COVERAGE_DEBT_SCHEDULER`，默认关闭；债务记录保存在
 `<LANCEDB_PATH>/<MEMORY_TABLE_NAME>_coverage_debts.json`，不会进入语义、
 词法、符号检索或回答上下文。

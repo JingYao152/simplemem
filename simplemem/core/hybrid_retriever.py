@@ -18,6 +18,10 @@ from simplemem.core.memweaver.asof import (
 )
 from simplemem.core.memweaver.expansion import expand_one_hop, scoring_text
 from simplemem.core.memweaver.bundles import select_requirement_bundles
+from simplemem.core.memweaver.proof_weave import (
+    plan_requires_evidence_weave,
+    select_constraint_evidence_weave,
+)
 from simplemem.core.reranker import CrossEncoderReranker
 from simplemem.core.settings import settings as config
 import re
@@ -55,6 +59,7 @@ class HybridRetriever:
         enable_expansion: Optional[bool] = None,
         enable_rerank: Optional[bool] = None,
         enable_requirement_bundles: Optional[bool] = None,
+        enable_constraint_evidence_weave: Optional[bool] = None,
         reranker: Optional[CrossEncoderReranker] = None,
         state_anchor_store: Optional[VectorStore] = None,
         enable_dual_view_state_anchors: Optional[bool] = None,
@@ -104,6 +109,15 @@ class HybridRetriever:
                 enable_requirement_bundles
                 if enable_requirement_bundles is not None
                 else getattr(config, "ENABLE_REQUIREMENT_BUNDLES", False)
+            )
+        )
+        self.enable_constraint_evidence_weave = (
+            self.enable_memweaver
+            and self.enable_rerank
+            and (
+                enable_constraint_evidence_weave
+                if enable_constraint_evidence_weave is not None
+                else getattr(config, "ENABLE_CONSTRAINT_EVIDENCE_WEAVE", False)
             )
         )
         self.enable_dual_view_state_anchors = (
@@ -308,15 +322,35 @@ class HybridRetriever:
             and information_plan
             and information_plan.get("required_info")
         )
+        proof_weave_enabled = bool(
+            self.enable_constraint_evidence_weave
+            and information_plan
+            and plan_requires_evidence_weave(information_plan)
+        )
         ranked, reranked = self.reranker.rerank(
             query,
             entries,
             to_text=lambda entry: scoring_text(
                 entry, provenance.get(entry.entry_id)
             ),
-            top_k=len(entries) if bundle_enabled else None,
+            top_k=len(entries) if bundle_enabled or proof_weave_enabled else None,
         )
-        if bundle_enabled and reranked:
+        if proof_weave_enabled and reranked:
+            ranked = select_constraint_evidence_weave(
+                required_info=information_plan["required_info"],
+                ranked_entries=ranked,
+                reranker=self.reranker,
+                to_text=lambda entry: scoring_text(
+                    entry, provenance.get(entry.entry_id)
+                ),
+                provenance=provenance,
+                top_k=self.reranker.top_k,
+            )
+            print(
+                f"[Proof Weave] {len(entries)} ranked candidates -> "
+                f"{len(ranked)} contexts"
+            )
+        elif bundle_enabled and reranked:
             ranked = select_requirement_bundles(
                 required_info=information_plan["required_info"],
                 ranked_entries=ranked,

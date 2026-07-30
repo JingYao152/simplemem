@@ -7,9 +7,10 @@ Implements:
 - Result merging: C_q = R_sem ∪ R_lex ∪ R_sym
 """
 from typing import List, Optional, Dict, Any
-from simplemem.core.models.memory_entry import MemoryEntry
+from simplemem.core.models.memory_entry import KIND_FACT, KIND_SET_VIEW, MemoryEntry
 from simplemem.core.utils.llm_client import LLMClient
 from simplemem.core.database.vector_store import VectorStore
+from simplemem.core.database.vector_store_backend import FieldPredicate
 from simplemem.core.memweaver.asof import (
     apply_asof,
     asof_filters,
@@ -63,6 +64,7 @@ class HybridRetriever:
         reranker: Optional[CrossEncoderReranker] = None,
         state_anchor_store: Optional[VectorStore] = None,
         enable_dual_view_state_anchors: Optional[bool] = None,
+        enable_set_views: Optional[bool] = None,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
@@ -134,6 +136,14 @@ class HybridRetriever:
                 "state_anchor_store is required when dual-view state anchors are enabled"
             )
         self.reranker = reranker or CrossEncoderReranker()
+
+        # Set-view materialization: opt-in flag, independent of enable_memweaver
+        # so it can be ablated separately.
+        self.enable_set_views = (
+            enable_set_views
+            if enable_set_views is not None
+            else getattr(config, "ENABLE_SET_VIEWS", False)
+        )
 
         # Use config values as default if not explicitly provided
         self.enable_planning = enable_planning if enable_planning is not None else getattr(config, 'ENABLE_PLANNING', True)
@@ -210,9 +220,9 @@ class HybridRetriever:
     def _retrieve_with_planning(self, query: str, enable_reflection: Optional[bool] = None) -> List[MemoryEntry]:
         """
         Execute retrieval with intelligent planning process
-        
+
         Args:
-        - query: Search query  
+        - query: Search query
         - enable_reflection: Override reflection setting for this query
         """
         print(f"\n[Planning] Analyzing information requirements for: {query}")
@@ -223,6 +233,26 @@ class HybridRetriever:
         # Step 1: Intelligent analysis of what information is needed
         information_plan = self._analyze_information_requirements(query)
         print(f"[Planning] Identified {len(information_plan['required_info'])} information requirements")
+
+        # Set-view routing: if the query is set-type and set-views are enabled,
+        # retrieve matching set-view entries and collect their member IDs for
+        # deduplication of atomic facts.
+        set_entries: List[MemoryEntry] = []
+        covered_ids: set = set()
+        is_set_query = (
+            self.enable_set_views
+            and information_plan.get("query_type") == "set"
+        )
+        if is_set_query:
+            set_entries, covered_ids = self._retrieve_set_views(query)
+            if set_entries:
+                print(
+                    f"[Set-Views] {len(set_entries)} set(s) matched, "
+                    f"{len(covered_ids)} atomic fact(s) covered"
+                )
+            else:
+                print("[Set-Views] No matching sets; falling back to atomic-only")
+                is_set_query = False
 
         # Step 2: Generate minimal necessary queries based on the plan
         search_queries = self._generate_targeted_queries(query, information_plan)
@@ -253,23 +283,43 @@ class HybridRetriever:
 
         # Step 4: Merge and deduplicate results
         merged_results = self._merge_and_deduplicate_entries(all_results)
+        # Exclude set-view entries from the atomic retrieval path; they are
+        # retrieved separately via _retrieve_set_views.
+        if self.enable_set_views:
+            merged_results = [
+                entry for entry in merged_results
+                if entry.kind != KIND_SET_VIEW
+            ]
         print(f"[Planning] Found {len(merged_results)} unique results (semantic + keyword + structured)")
-        
+
         # Step 5: Optional reflection-based additional retrieval
         # Use override parameter if provided, otherwise use global setting
         should_use_reflection = enable_reflection if enable_reflection is not None else self.enable_reflection
-        
+
         if should_use_reflection:
             merged_results = self._retrieve_with_intelligent_reflection(
                 query, merged_results, information_plan, as_of=as_of
             )
 
         # Step 6: one-hop fabric expansion + flat cross-encoder rerank (P2)
-        return self._expand_and_rerank(
+        atomic_results = self._expand_and_rerank(
             query,
             merged_results,
             information_plan=information_plan,
         )
+
+        # Set-view post-processing: deduplicate covered atomic facts and
+        # prepend set-view entries.
+        if is_set_query and covered_ids:
+            atomic_results = [
+                entry for entry in atomic_results
+                if entry.entry_id not in covered_ids
+            ]
+            print(
+                f"[Set-Views] {len(covered_ids)} covered fact(s) deduplicated "
+                f"from atomic results"
+            )
+        return set_entries + atomic_results
 
     # ------------------------------------------------------------------
     # One-hop expansion + rerank (design doc section 5)
@@ -373,31 +423,54 @@ class HybridRetriever:
         )
         return ranked
 
+    # ------------------------------------------------------------------
+    # Set-view retrieval (set-views spec)
+    # ------------------------------------------------------------------
+
+    def _retrieve_set_views(
+        self,
+        query: str,
+    ) -> tuple:
+        """Semantic-search for matching set-view entries.
+
+        Returns ``(set_entries, covered_ids)`` where ``covered_ids`` is the set
+        of atomic fact ``entry_id`` values that are members of any returned set.
+        """
+        set_entries = self.vector_store.semantic_search(
+            query,
+            top_k=self.semantic_top_k,
+            filters={"kind": KIND_SET_VIEW},
+        )
+        covered_ids: set = set()
+        for entry in set_entries:
+            covered_ids.update(entry.set_member_ids)
+        return set_entries, covered_ids
+
     def _retrieve_with_reflection(self, query: str, initial_results: List[MemoryEntry], as_of: str = "") -> List[MemoryEntry]:
         """
         Execute reflection-based additional retrieval
         """
         current_results = initial_results
-        
+
         for round_num in range(self.max_reflection_rounds):
             print(f"\n[Reflection Round {round_num + 1}] Checking if results are sufficient...")
-            
+
             # Quick answer attempt with current results
             if not current_results:
                 answer_status = "no_results"
             else:
                 answer_status = self._check_answer_adequacy(query, current_results)
-            
+
             if answer_status == "sufficient":
                 print(f"[Reflection Round {round_num + 1}] Information is sufficient")
                 break
             elif answer_status == "insufficient":
                 print(f"[Reflection Round {round_num + 1}] Information is insufficient, generating additional queries...")
-                
+
                 # Generate additional targeted queries based on what's missing
                 additional_queries = self._generate_additional_queries(query, current_results)
                 print(f"[Reflection Round {round_num + 1}] Generated {len(additional_queries)} additional queries")
-                
+
                 # Execute additional searches (parallel or sequential)
                 if self.enable_parallel_retrieval and len(additional_queries) > 1:
                     print(f"[Reflection Round {round_num + 1}] Executing {len(additional_queries)} additional queries in parallel")
@@ -408,16 +481,16 @@ class HybridRetriever:
                         print(f"[Additional Search {i}] {add_query}")
                         results = self._semantic_search(add_query, as_of=as_of)
                         additional_results.extend(results)
-                
+
                 # Merge with existing results
                 all_results = current_results + additional_results
                 current_results = self._merge_and_deduplicate_entries(all_results)
                 print(f"[Reflection Round {round_num + 1}] Total results: {len(current_results)}")
-                
+
             else:  # "no_results"
                 print(f"[Reflection Round {round_num + 1}] No results found, cannot continue reflection")
                 break
-        
+
         return current_results
 
     def _analyze_query(self, query: str) -> Dict[str, Any]:
@@ -615,7 +688,7 @@ Return ONLY JSON, no other content.
                     merged.append(entry)
 
         return merged
-    
+
     def _generate_search_queries(self, query: str) -> List[str]:
         """
         Generate multiple search queries for comprehensive retrieval
@@ -639,7 +712,7 @@ Return your response in JSON format:
 {{
   "queries": [
     "search query 1",
-    "search query 2", 
+    "search query 2",
     "search query 3",
     ...
   ]
@@ -648,52 +721,52 @@ Return your response in JSON format:
 
 Return ONLY the JSON, no other text.
 """
-        
+
         messages = [
             {"role": "system", "content": "You are a search query generation assistant. You must output valid JSON format."},
             {"role": "user", "content": prompt}
         ]
-        
+
         try:
             # Use JSON format if configured
             response_format = None
             if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
                 response_format = {"type": "json_object"}
-                
+
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
                 response_format=response_format
             )
-            
+
             result = self.llm_client.extract_json(response)
             queries = result.get("queries", [query])
-            
+
             # Ensure original query is included
             if query not in queries:
                 queries.insert(0, query)
-                
+
             return queries
-            
+
         except Exception as e:
             print(f"Failed to generate search queries: {e}")
             # Fallback to original query
             return [query]
-    
+
     def _merge_and_deduplicate_entries(self, entries: List[MemoryEntry]) -> List[MemoryEntry]:
         """
         Merge and deduplicate memory entries by entry_id
         """
         seen_ids = set()
         merged = []
-        
+
         for entry in entries:
             if entry.entry_id not in seen_ids:
                 seen_ids.add(entry.entry_id)
                 merged.append(entry)
-        
+
         return merged
-    
+
     def _check_answer_adequacy(self, query: str, contexts: List[MemoryEntry]) -> str:
         """
         Check if current contexts are sufficient to answer the query
@@ -701,10 +774,10 @@ Return ONLY the JSON, no other text.
         """
         if not contexts:
             return "no_results"
-        
+
         # Format contexts
         context_str = self._format_contexts_for_check(contexts)
-        
+
         prompt = f"""
 You are evaluating whether the provided context contains sufficient information to answer a user question.
 
@@ -731,38 +804,38 @@ Return your evaluation in JSON format:
 
 Return ONLY the JSON, no other text.
 """
-        
+
         messages = [
             {"role": "system", "content": "You are an information adequacy evaluator. You must output valid JSON format."},
             {"role": "user", "content": prompt}
         ]
-        
+
         try:
             # Use JSON format if configured
             response_format = None
             if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
                 response_format = {"type": "json_object"}
-                
+
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.1,
                 response_format=response_format
             )
-            
+
             result = self.llm_client.extract_json(response)
             return result.get("assessment", "insufficient")
-            
+
         except Exception as e:
             print(f"Failed to check answer adequacy: {e}")
             # Default to insufficient to be safe
             return "insufficient"
-    
+
     def _generate_additional_queries(self, original_query: str, current_contexts: List[MemoryEntry]) -> List[str]:
         """
         Generate additional targeted queries based on what's missing
         """
         context_str = self._format_contexts_for_check(current_contexts)
-        
+
         prompt = f"""
 Based on the original question and current available information, generate additional specific search queries that would help find the missing information needed to answer the question completely.
 
@@ -792,31 +865,31 @@ Return your response in JSON format:
 
 Return ONLY the JSON, no other text.
 """
-        
+
         messages = [
             {"role": "system", "content": "You are a search strategy assistant. You must output valid JSON format."},
             {"role": "user", "content": prompt}
         ]
-        
+
         try:
             # Use JSON format if configured
             response_format = None
             if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
                 response_format = {"type": "json_object"}
-                
+
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
                 response_format=response_format
             )
-            
+
             result = self.llm_client.extract_json(response)
             return result.get("additional_queries", [])
-            
+
         except Exception as e:
             print(f"Failed to generate additional queries: {e}")
             return []
-    
+
     def _format_contexts_for_check(self, contexts: List[MemoryEntry]) -> str:
         """
         Format contexts for adequacy checking (more concise than full format)
@@ -827,9 +900,9 @@ Return ONLY the JSON, no other text.
             if entry.timestamp:
                 parts.append(f"Time: {entry.timestamp}")
             formatted.append(" | ".join(parts))
-        
+
         return "\n".join(formatted)
-    
+
     def _execute_parallel_searches(self, search_queries: List[str], as_of: str = "") -> List[MemoryEntry]:
         """
         Execute multiple search queries in parallel using ThreadPoolExecutor
@@ -845,7 +918,7 @@ Return ONLY the JSON, no other text.
                 for i, query in enumerate(search_queries, 1):
                     future = executor.submit(self._semantic_search_worker, query, i, as_of)
                     future_to_query[future] = (query, i)
-                
+
                 # Collect results as they complete
                 for future in concurrent.futures.as_completed(future_to_query):
                     query, query_num = future_to_query[future]
@@ -855,7 +928,7 @@ Return ONLY the JSON, no other text.
                         print(f"[Parallel Search] Query {query_num} completed: {len(results)} results")
                     except Exception as e:
                         print(f"[Parallel Search] Query {query_num} failed: {e}")
-                        
+
         except Exception as e:
             print(f"[Parallel Search] Parallel execution failed: {e}. Falling back to sequential search...")
             # Fallback to sequential processing
@@ -890,7 +963,7 @@ Return ONLY the JSON, no other text.
                 for i, query in enumerate(additional_queries, 1):
                     future = executor.submit(self._additional_search_worker, query, i, round_num, as_of)
                     future_to_query[future] = (query, i)
-                
+
                 # Collect results as they complete
                 for future in concurrent.futures.as_completed(future_to_query):
                     query, query_num = future_to_query[future]
@@ -900,7 +973,7 @@ Return ONLY the JSON, no other text.
                         print(f"[Reflection Round {round_num}] Additional query {query_num} completed: {len(results)} results")
                     except Exception as e:
                         print(f"[Reflection Round {round_num}] Additional query {query_num} failed: {e}")
-                        
+
         except Exception as e:
             print(f"[Reflection Round {round_num}] Parallel execution failed: {e}. Falling back to sequential search...")
             # Fallback to sequential processing
@@ -920,7 +993,7 @@ Return ONLY the JSON, no other text.
         """
         print(f"[Additional Search {query_num}] {query}")
         return self._semantic_search(query, as_of=as_of)
-    
+
     def _analyze_information_requirements(self, query: str) -> Dict[str, Any]:
         """
         Retrieval Planning (Section 3.3)
@@ -936,11 +1009,16 @@ Think step by step:
 2. What key entities, events, or concepts need to be identified?
 3. What relationships or connections need to be established?
 4. What minimal set of information pieces would be sufficient to answer this question?
+5. Is this a **set-type** question that asks for a complete enumeration of an
+   entity's activities, preferences, or attributes (e.g., "What camping has
+   Melanie done?", "List all of Bob's hobbies")? Or is it a **point** question
+   that asks for a specific fact, time, or location?
 
 Return your analysis in JSON format:
 ```json
 {{
   "question_type": "type of question",
+  "query_type": "set or point",
   "key_entities": ["entity1", "entity2", ...],
   "required_info": [
     {{
@@ -958,38 +1036,39 @@ Focus on identifying the minimal essential information needed, not exhaustive de
 
 Return ONLY the JSON, no other text.
 """
-        
+
         messages = [
             {"role": "system", "content": "You are an intelligent information requirement analyst. You must output valid JSON format."},
             {"role": "user", "content": prompt}
         ]
-        
+
         try:
             # Use JSON format if configured
             response_format = None
             if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
                 response_format = {"type": "json_object"}
-                
+
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.2,
                 response_format=response_format
             )
-            
+
             result = self.llm_client.extract_json(response)
             return result
-            
+
         except Exception as e:
             print(f"Failed to analyze information requirements: {e}")
             # Fallback to simple analysis
             return {
                 "question_type": "general",
+                "query_type": "point",
                 "key_entities": [query],
                 "required_info": [{"info_type": "general", "description": "relevant information", "priority": "high"}],
                 "relationships": [],
                 "minimal_queries_needed": 1
             }
-    
+
     def _generate_targeted_queries(self, original_query: str, information_plan: Dict[str, Any]) -> List[str]:
         """
         Generate minimal targeted queries based on information requirements analysis
@@ -1029,67 +1108,67 @@ Return your response in JSON format:
 
 Return ONLY the JSON, no other text.
 """
-        
+
         messages = [
             {"role": "system", "content": "You are a query generation specialist. You must output valid JSON format."},
             {"role": "user", "content": prompt}
         ]
-        
+
         try:
             # Use JSON format if configured
             response_format = None
             if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
                 response_format = {"type": "json_object"}
-                
+
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
                 response_format=response_format
             )
-            
+
             result = self.llm_client.extract_json(response)
             queries = result.get("queries", [original_query])
-            
+
             # Ensure original query is included and limit to reasonable number
             if original_query not in queries:
                 queries.insert(0, original_query)
-            
+
             # Limit to max 4 queries for efficiency
             queries = queries[:4]
-            
+
             print(f"[Planning] Strategy: {result.get('reasoning', 'Generate targeted queries')}")
             return queries
-            
+
         except Exception as e:
             print(f"Failed to generate targeted queries: {e}")
             # Fallback to original query
             return [original_query]
-    
+
     def _retrieve_with_intelligent_reflection(self, query: str, initial_results: List[MemoryEntry], information_plan: Dict[str, Any], as_of: str = "") -> List[MemoryEntry]:
         """
         Execute intelligent reflection-based additional retrieval
         """
         current_results = initial_results
-        
+
         for round_num in range(self.max_reflection_rounds):
             print(f"\n[Intelligent Reflection Round {round_num + 1}] Analyzing information completeness...")
-            
+
             # Intelligent analysis of information completeness
             if not current_results:
                 completeness_status = "no_results"
             else:
                 completeness_status = self._analyze_information_completeness(query, current_results, information_plan)
-            
+
             if completeness_status == "complete":
                 print(f"[Intelligent Reflection Round {round_num + 1}] Information is complete")
                 break
             elif completeness_status == "incomplete":
                 print(f"[Intelligent Reflection Round {round_num + 1}] Information is incomplete, generating targeted additional queries...")
-                
+
                 # Generate targeted additional queries based on what's missing
                 additional_queries = self._generate_missing_info_queries(query, current_results, information_plan)
                 print(f"[Intelligent Reflection Round {round_num + 1}] Generated {len(additional_queries)} targeted queries")
-                
+
                 # Execute additional searches
                 if self.enable_parallel_retrieval and len(additional_queries) > 1:
                     print(f"[Intelligent Reflection Round {round_num + 1}] Executing {len(additional_queries)} queries in parallel")
@@ -1100,28 +1179,28 @@ Return ONLY the JSON, no other text.
                         print(f"[Additional Search {i}] {add_query}")
                         results = self._semantic_search(add_query, as_of=as_of)
                         additional_results.extend(results)
-                
+
                 # Merge with existing results
                 all_results = current_results + additional_results
                 current_results = self._merge_and_deduplicate_entries(all_results)
                 print(f"[Intelligent Reflection Round {round_num + 1}] Total results: {len(current_results)}")
-                
+
             else:  # "no_results"
                 print(f"[Intelligent Reflection Round {round_num + 1}] No results found, cannot continue reflection")
                 break
-        
+
         return current_results
-    
+
     def _analyze_information_completeness(self, query: str, current_results: List[MemoryEntry], information_plan: Dict[str, Any]) -> str:
         """
         Analyze if current results provide complete information to answer the query
         """
         if not current_results:
             return "no_results"
-        
+
         context_str = self._format_contexts_for_check(current_results)
         required_info = information_plan.get('required_info', [])
-        
+
         prompt = f"""
 Analyze whether the provided information is sufficient to completely answer the original question, based on the identified information requirements.
 
@@ -1149,42 +1228,42 @@ Return your evaluation in JSON format:
 
 Return ONLY the JSON, no other text.
 """
-        
+
         messages = [
             {"role": "system", "content": "You are an information completeness evaluator. You must output valid JSON format."},
             {"role": "user", "content": prompt}
         ]
-        
+
         try:
             # Use JSON format if configured
             response_format = None
             if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
                 response_format = {"type": "json_object"}
-                
+
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.1,
                 response_format=response_format
             )
-            
+
             result = self.llm_client.extract_json(response)
             assessment = result.get("assessment", "incomplete")
             coverage = result.get("coverage_percentage", 0)
-            
+
             print(f"[Intelligent Reflection] Coverage: {coverage}% - {result.get('reasoning', '')}")
             return assessment
-            
+
         except Exception as e:
             print(f"Failed to analyze information completeness: {e}")
             return "incomplete"
-    
+
     def _generate_missing_info_queries(self, original_query: str, current_results: List[MemoryEntry], information_plan: Dict[str, Any]) -> List[str]:
         """
         Generate targeted queries to find missing information
         """
         context_str = self._format_contexts_for_check(current_results)
         required_info = information_plan.get('required_info', [])
-        
+
         prompt = f"""
 Based on the original question, required information types, and currently available information, generate targeted search queries to find the missing information needed to answer the question completely.
 
@@ -1214,30 +1293,30 @@ Return your response in JSON format:
 
 Return ONLY the JSON, no other text.
 """
-        
+
         messages = [
             {"role": "system", "content": "You are a missing information query generator. You must output valid JSON format."},
             {"role": "user", "content": prompt}
         ]
-        
+
         try:
             # Use JSON format if configured
             response_format = None
             if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
                 response_format = {"type": "json_object"}
-                
+
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
                 response_format=response_format
             )
-            
+
             result = self.llm_client.extract_json(response)
             queries = result.get("targeted_queries", [])
-            
+
             print(f"[Intelligent Reflection] Missing info: {result.get('missing_analysis', 'Unknown')}")
             return queries
-            
+
         except Exception as e:
             print(f"Failed to generate missing info queries: {e}")
             return []

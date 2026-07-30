@@ -143,6 +143,13 @@ Current summary: {thread_summary or "(no summary yet - this thread is new)"}
    support it. Every turn that contains only greeting, acknowledgement, or
    repeated confirmation must appear in exempt_turn_ids. Do not exempt a turn
    that introduces a preference, event, plan, state, or other factual detail.
+6. **Set Key**: Assign each fact a ``set_key`` of the form
+   ``"<entity>:<predicate>"`` (e.g., ``"Melanie:camping"``,
+   ``"Bob:work_project"``) when the fact belongs to a potentially multi-member
+   aggregation group — i.e., the entity may have multiple facts about the same
+   predicate across sessions. Use an empty string for isolated events with no
+   natural aggregation group. Facts that share the same ``set_key`` across
+   different sessions form one cross-session aggregation set.
 
 [Weaving - how each new fact relates to an existing candidate]
 - "supersede": the new fact replaces a candidate that is no longer true
@@ -175,7 +182,8 @@ longer matches the rewritten summary.
       "entities": ["entity1"],
       "topic": "topic phrase",
       "source_turn_ids": [12],
-      "weave": {{"op": "none|supersede|refine|bridge", "target": null}}
+      "weave": {{"op": "none|supersede|refine|bridge", "target": null}},
+      "set_key": "Melanie:camping"
     }}
   ],
   "summary": "rewritten thread summary",

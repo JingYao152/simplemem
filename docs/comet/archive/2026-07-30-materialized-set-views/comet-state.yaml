@@ -1,0 +1,23 @@
+schema: comet.native.v3
+minimum_runtime_version: 3
+revision: 7
+verification_protocol: legacy-v1
+name: materialized-set-views
+language: en
+phase: archive
+brief: brief.md
+approval: confirmed
+approved_contract_hash: d31e2b98f52c9208b53b001bc00853a9a22a22cd3d3061d856dd8038860e9d17
+spec_changes:
+  - capability: materialized-set-views
+    operation: create
+    source: specs/materialized-set-views/spec.md
+    base_hash: null
+verification_result: pass
+verification_report: verification.md
+implementation_scope: runtime/evidence/scopes/74625784c85e7255b45b7b23516fd036021d57cf222587880af19b317bedcf15.json
+verification_evidence: runtime/evidence/verifications/35cb894b9057eb98bdcfc0b6a8e26106b3af3cd48b0212f06ec85f54a8dedc42.json
+partial_allowance: null
+archived: true
+created_at: 2026-07-30
+run_id: 1ac528d8-cebb-47f2-b835-5d824baa4c27

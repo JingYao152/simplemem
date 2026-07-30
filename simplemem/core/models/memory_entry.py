@@ -18,6 +18,8 @@ import uuid
 KIND_FACT = "fact"
 KIND_THREAD_SUMMARY = "thread_summary"
 KIND_ENTITY_PROFILE = "entity_profile"
+# Materialized set-view kind (set-views spec)
+KIND_SET_VIEW = "set_view"
 
 # Typed weave operations (design doc section 3)
 WEAVE_NONE = "none"
@@ -108,6 +110,21 @@ class MemoryEntry(BaseModel):
         description="Dialogue ids in the source session that support this fact"
     )
 
+    # [Set-View Layer] - Materialized aggregation set fields.
+    # For atomic facts: ``set_key`` is the aggregation group assigned by Call B
+    # (e.g. "Melanie:camping"), or empty when the fact has no natural group.
+    # For set-view entries: ``set_key`` is the same key, and ``set_member_ids``
+    # lists the entry_ids of all member facts in chronological order.
+    set_key: str = Field(
+        default="",
+        description='Aggregation group key of the form "<entity>:<predicate>", '
+                    "or empty for isolated facts"
+    )
+    set_member_ids: List[str] = Field(
+        default_factory=list,
+        description="For set-view entries: entry_ids of all member facts"
+    )
+
     @staticmethod
     def thread_summary_id(thread_id: str) -> str:
         """Fixed id convention for a living thread summary entry."""
@@ -117,6 +134,11 @@ class MemoryEntry(BaseModel):
     def entity_profile_id(name: str) -> str:
         """Fixed id convention for an entity profile entry."""
         return f"profile::{name}"
+
+    @staticmethod
+    def set_view_id(set_key: str) -> str:
+        """Fixed id convention for a materialized set-view entry."""
+        return f"set_view::{set_key}"
 
     @property
     def is_open(self) -> bool:

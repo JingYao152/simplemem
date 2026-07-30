@@ -63,6 +63,7 @@ from simplemem.core.memweaver.prompts import (
     build_thread_assignment_prompt,
     build_thread_update_prompt,
 )
+from simplemem.core.memweaver.set_views import maintain_sets as maintain_set_views
 from simplemem.core.models.memory_entry import (
     KIND_FACT,
     WEAVE_BRIDGE,
@@ -139,6 +140,7 @@ class MemWeaver:
         enable_dual_view_state_anchors: Optional[bool] = None,
         enable_coverage_debt_scheduler: Optional[bool] = None,
         coverage_debt_store: Optional[CoverageDebtStore] = None,
+        enable_set_views: Optional[bool] = None,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
@@ -189,6 +191,11 @@ class MemWeaver:
             enable_coverage_debt_scheduler
             if enable_coverage_debt_scheduler is not None
             else getattr(config, "ENABLE_COVERAGE_DEBT_SCHEDULER", False)
+        )
+        self.enable_set_views = (
+            enable_set_views
+            if enable_set_views is not None
+            else getattr(config, "ENABLE_SET_VIEWS", False)
         )
         self.coverage_debt_store = coverage_debt_store
         if self.enable_coverage_debt_scheduler and self.coverage_debt_store is None:
@@ -256,6 +263,15 @@ class MemWeaver:
                     "coverage_debts_repaired": 0,
                     "coverage_debts_exempted": 0,
                     "coverage_facts_repaired": 0,
+                }
+            )
+        if self.enable_set_views:
+            self.stats.update(
+                {
+                    "set_views_created": 0,
+                    "set_views_updated": 0,
+                    "set_members_added": 0,
+                    "set_text_truncated": 0,
                 }
             )
 
@@ -383,9 +399,45 @@ class MemWeaver:
         self._apply_session(
             assignments, updates, snapshot, session_date, session_datetime
         )
+        self._maintain_set_views(updates)
         self._audit_coverage(assignments, updates, session_date)
         self._repair_debts(repair_debts, session_date)
         self.processed_count += len(turns)
+
+    # ------------------------------------------------------------------
+    # Set-view maintenance
+    # ------------------------------------------------------------------
+
+    def _maintain_set_views(self, updates: Sequence[ThreadUpdate]) -> None:
+        """Create or update materialized set-view entries for this session."""
+        if not self.enable_set_views:
+            return
+
+        new_facts = [
+            fact
+            for update in updates
+            for fact in update.facts
+            if fact.set_key
+        ]
+        if not new_facts:
+            return
+
+        stats = maintain_set_views(self.vector_store, new_facts)
+        for key, value in stats.items():
+            mapped = {
+                "sets_created": "set_views_created",
+                "sets_updated": "set_views_updated",
+                "members_added": "set_members_added",
+                "text_truncated": "set_text_truncated",
+            }.get(key, key)
+            if value:
+                self._bump(mapped, value)
+        if stats["sets_created"] or stats["sets_updated"]:
+            print(
+                f"[MemWeaver] set-views: {stats['sets_created']} created, "
+                f"{stats['sets_updated']} updated, "
+                f"{stats['members_added']} members added"
+            )
 
     # ------------------------------------------------------------------
     # Coverage debts - source-turn audit and deferred repair
@@ -875,6 +927,8 @@ class MemWeaver:
         ]
         timestamp = item.get("timestamp")
         timestamp = timestamp if isinstance(timestamp, str) and timestamp else None
+        set_key = item.get("set_key")
+        set_key = set_key if isinstance(set_key, str) else ""
         return MemoryEntry(
             lossless_restatement=restatement.strip(),
             keywords=_string_list(item.get("keywords")),
@@ -888,6 +942,7 @@ class MemWeaver:
             # Fact's own timestamp when it has one, else the session date.
             valid_from=to_day(timestamp) or session_date,
             source_turn_ids=source_turn_ids,
+            set_key=set_key,
         )
 
     def _parse_weave(

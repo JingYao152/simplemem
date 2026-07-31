@@ -75,14 +75,48 @@ def _load_existing_set(
 def _collect_member_facts(
     vector_store: VectorStore,
     set_key: str,
+    existing_member_ids: Sequence[str] = (),
+    new_facts: Sequence[MemoryEntry] = (),
 ) -> List[MemoryEntry]:
-    """Return all facts with the given ``set_key``, in chronological order."""
-    all_entries = vector_store.get_all_entries()
-    members = [
-        entry
-        for entry in all_entries
-        if entry.kind == KIND_FACT and entry.set_key == set_key
-    ]
+    """Return all facts for the set, in chronological order.
+
+    Combines three sources:
+    1. Member IDs from a previous set-view entry (cross-session persistence).
+    2. New facts from the current session that carry this ``set_key``.
+    3. Stored facts whose ``set_key`` matches (works when the column exists).
+
+    Deduplicates by ``entry_id`` and sorts chronologically.
+    """
+    # Start with existing member IDs from the previous set-view entry
+    all_ids = set(existing_member_ids)
+
+    # Add new facts from this session that match the set_key
+    session_facts: Dict[str, MemoryEntry] = {}
+    for fact in new_facts:
+        if fact.set_key == set_key and fact.kind == KIND_FACT:
+            all_ids.add(fact.entry_id)
+            session_facts[fact.entry_id] = fact
+
+    # Also try matching by set_key in storage (works when the column is persisted)
+    try:
+        all_entries = vector_store.get_all_entries()
+        for entry in all_entries:
+            if entry.kind == KIND_FACT and entry.set_key == set_key:
+                all_ids.add(entry.entry_id)
+    except Exception:
+        pass
+
+    # Load all member facts by ID from storage
+    stored = vector_store.get_by_ids(list(all_ids)) if all_ids else []
+    stored_by_id = {entry.entry_id: entry for entry in stored}
+
+    # Merge: prefer stored entries (they have full metadata), fall back to session facts
+    members: List[MemoryEntry] = []
+    for fid in all_ids:
+        entry = stored_by_id.get(fid) or session_facts.get(fid)
+        if entry is not None:
+            members.append(entry)
+
     members.sort(key=lambda f: (f.valid_from or "", f.entry_id))
     return members
 
@@ -113,7 +147,13 @@ def maintain_sets(
 
     for set_key in set_keys:
         existing = _load_existing_set(vector_store, set_key)
-        member_facts = _collect_member_facts(vector_store, set_key)
+        existing_ids = existing.set_member_ids if existing else []
+        member_facts = _collect_member_facts(
+            vector_store,
+            set_key,
+            existing_member_ids=existing_ids,
+            new_facts=new_facts,
+        )
         if not member_facts:
             continue
 

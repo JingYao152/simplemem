@@ -929,14 +929,23 @@ class MemWeaver:
         timestamp = timestamp if isinstance(timestamp, str) and timestamp else None
         set_key = item.get("set_key")
         set_key = set_key if isinstance(set_key, str) else ""
+
+        # 确定性 fallback：LLM 未输出 set_key 时，从 persons + topic 派生
+        persons_list = _string_list(item.get("persons"))
+        topic_val = item.get("topic") if isinstance(item.get("topic"), str) else None
+        if not set_key and persons_list and topic_val:
+            # 取 topic 前两个词作为谓词，避免过长 key 导致分组过碎
+            predicate = " ".join(topic_val.split()[:2]).lower()
+            set_key = f"{persons_list[0]}:{predicate}"
+
         return MemoryEntry(
             lossless_restatement=restatement.strip(),
             keywords=_string_list(item.get("keywords")),
             timestamp=timestamp,
             location=item.get("location") if isinstance(item.get("location"), str) else None,
-            persons=_string_list(item.get("persons")),
+            persons=persons_list,
             entities=_string_list(item.get("entities")),
-            topic=item.get("topic") if isinstance(item.get("topic"), str) else None,
+            topic=topic_val,
             kind=KIND_FACT,
             thread_id=thread_id,
             # Fact's own timestamp when it has one, else the session date.
